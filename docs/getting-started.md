@@ -156,6 +156,7 @@ python3 uninstall.py
 
 ## 下一步
 
+- [Feature Reference](feature-reference.md) — 完整能力索引
 - [Command Reference](command-reference.md) — 命令和使用场景
 - [Architecture](architecture.md) — 系统边界与设计原则
 - [Engineering Notes](engineering-notes.md) — 为什么项目会做成现在这样

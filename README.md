@@ -39,7 +39,7 @@ WorkBuddy Toolkit 是一个本地 sidecar 工具箱，用来解决多账号切�
 | 每日签到、连续任务需要重复操作 | `wb-checkin` + 平台原生调度 |
 | WorkBuddy 更新后内部格式或运行时行为变化 | `wb-doctor` 显式检查兼容性和上游漂移 |
 
-Toolkit 还提供模型资产查看、终端调用、可选容灾 Router、Sandbox 自愈和日志生命周期治理。这些是高级能力，不是第一次安装必须理解的内容。
+Toolkit 还提供模型资产查看、终端调用、可选容灾 Router、Sandbox 自愈和日志生命周期治理。这些是高级能力，不是第一次安装必须理解的内容。完整能力索引见 [Feature Reference](docs/feature-reference.md)。
 
 ---
 
@@ -171,7 +171,7 @@ Toolkit 还包含一组从真实故障中长出来的运行时保护：
 - 并发修复路径的互斥保护；
 - 可回滚的 sidecar 安装模型。
 
-这些能力的完整解释不再塞在 README 中。见 [Architecture](docs/architecture.md) 和 [Engineering Notes](docs/engineering-notes.md)。
+这些能力的完整解释不再塞在 README 中。先看 [Feature Reference](docs/feature-reference.md)，需要理解实现边界时再看 [Architecture](docs/architecture.md) 和 [Engineering Notes](docs/engineering-notes.md)。
 
 ---
 
@@ -189,10 +189,11 @@ Toolkit 还包含一组从真实故障中长出来的运行时保护：
 
 按这个顺序看：
 
-1. [Architecture](docs/architecture.md)
-2. [Engineering Notes](docs/engineering-notes.md)
-3. [Incident Reports](docs/incidents/README.md)
-4. [ADR](docs/adr/) / [Specs](docs/specs/)
+1. [Feature Reference](docs/feature-reference.md)
+2. [Architecture](docs/architecture.md)
+3. [Engineering Notes](docs/engineering-notes.md)
+4. [Incident Reports](docs/incidents/README.md)
+5. [ADR](docs/adr/) / [Specs](docs/specs/)
 
 ### 我是 AI Agent
 
@@ -347,6 +348,7 @@ python3 uninstall.py
 | Document | When to read it |
 |---|---|
 | [Getting Started](docs/getting-started.md) | 第一次安装和配置 |
+| [Feature Reference](docs/feature-reference.md) | 查看完整能力索引，不污染 README 主线 |
 | [Command Reference](docs/command-reference.md) | 找命令和使用场景 |
 | [Architecture](docs/architecture.md) | 理解组件边界和设计原则 |
 | [Engineering Notes](docs/engineering-notes.md) | 理解关键逆向 / 根因和设计取舍 |

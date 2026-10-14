@@ -395,15 +395,48 @@ def check_token_format(value):
             return "malformed"
     return "malformed"
 
+LINUX_APP_CANDIDATES = [
+    "/opt/WorkBuddy/workbuddy",
+    "/opt/workbuddy/workbuddy",
+    "/opt/apps/workbuddy/workbuddy",
+    "/usr/lib/workbuddy/workbuddy",
+    "/usr/bin/workbuddy",
+    "/usr/local/bin/workbuddy",
+]
+
+TOOLKIT_CLI_MARKER = b"WorkBuddy Multi-Account Manager & Automation Toolkit"
+
+def _is_toolkit_cli(path):
+    """判断某个可执行文件是否就是 Toolkit 自己的 CLI（例如 ~/.local/bin/workbuddy）。
+
+    Linux 上 Toolkit 的 CLI 与 WorkBuddy 客户端同名，`which workbuddy` 往往先命中 CLI，
+    把它当成 Electron 运行时会导致解密永远失败、"重启客户端"变成启动 CLI 自己。
+    """
+    try:
+        if os.path.realpath(path) == os.path.realpath(os.path.abspath(__file__)):
+            return True
+    except Exception:
+        pass
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4096)
+        return head.startswith(b"#!") and TOOLKIT_CLI_MARKER in head
+    except OSError:
+        return False
+
+def _is_runnable_file(path):
+    return bool(path) and os.path.isfile(path) and (sys.platform == "win32" or os.access(path, os.X_OK))
+
 def find_workbuddy_runtime():
     """
     定位本机 WorkBuddy 可执行文件/运行时路径。
     优先读取 WORKBUDDY_EXE 环境变量，其次按操作系统探测标准安装路径。
+    任何指向 Toolkit 自身 CLI 的候选都会被排除。
     """
     override = os.environ.get("WORKBUDDY_EXE")
     if override:
         path = os.path.abspath(os.path.expanduser(override))
-        if os.path.isfile(path) and (sys.platform == "win32" or os.access(path, os.X_OK)):
+        if _is_runnable_file(path) and not _is_toolkit_cli(path):
             return path
         raise CredentialError("INVALID_RUNTIME_PATH")
 
@@ -435,17 +468,14 @@ def find_workbuddy_runtime():
         if which_exe:
             candidates.append(which_exe)
     else:  # Linux
+        # 先查固定安装路径；PATH 中的 `workbuddy` 很可能是 Toolkit 自己（~/.local/bin/workbuddy）
+        candidates.extend(LINUX_APP_CANDIDATES)
         which_wb = shutil.which("workbuddy")
         if which_wb:
             candidates.append(which_wb)
-        candidates.extend([
-            "/opt/WorkBuddy/workbuddy",
-            "/opt/workbuddy/workbuddy",
-            os.path.expanduser("~/.local/bin/workbuddy")
-        ])
 
     for p in candidates:
-        if p and os.path.isfile(p) and (sys.platform == "win32" or os.access(p, os.X_OK)):
+        if _is_runnable_file(p) and not _is_toolkit_cli(p):
             return os.path.abspath(p)
 
     raise CredentialError("RUNTIME_NOT_FOUND")
@@ -562,21 +592,48 @@ def resolve_credential_field(raw_value, field_name="accessToken"):
             raise CredentialError("INVALID_FORMAT")
         return val
 
+_PLAINTEXT_FALLBACK_WARNED = False
+
+def _warn_plaintext_fallback(reason):
+    """加密失败而回退明文时必须显式告知用户，不能静默建立明文凭据库。
+
+    仅在"当前客户端本应加密"（活跃凭据为 sym-v1，或已找到运行时但加密失败）时提示；
+    旧版 WorkBuddy 原生就是明文存储，此时不打扰。
+    """
+    global _PLAINTEXT_FALLBACK_WARNED
+    if _PLAINTEXT_FALLBACK_WARNED:
+        return
+    active = get_active_account()
+    auth = active.get("auth") if isinstance(active, dict) else None
+    active_fmt = check_token_format(auth.get("accessToken")) if isinstance(auth, dict) else "missing"
+    if reason == "RUNTIME_NOT_FOUND" and active_fmt != "sym-v1":
+        return
+    _PLAINTEXT_FALLBACK_WARNED = True
+    detail = AUTH_REASONS.get(reason, reason)
+    sys.stderr.write(
+        f"{COLOR_YELLOW}▲ 无法调用 WorkBuddy 运行时加密凭据（{detail}），本次凭据将以明文保存在权限 0600 的本地文件中。"
+        f"修复运行时（可运行 workbuddy doctor 排查）后重新执行 wb-login 即可加密保存。{COLOR_RESET}\n"
+    )
+
 def encrypt_credential_field(plaintext, field_name="accessToken"):
     """
     如果 WorkBuddy 客户端运行时可用且支持原生存储加密，将明文字段加密为 $wbEncrypted 信封格式；
-    若运行时不可用或处于测试/回退环境，安全保留原始字符串，由 WorkBuddy 在启动时透明迁移。
+    若运行时不可用，保留原始字符串（旧版客户端的原生格式），并在本应加密时向 stderr 发出明确警告。
     """
     if not isinstance(plaintext, str) or not plaintext:
         return plaintext
+    reason = "HELPER_PROTOCOL"
     try:
         runtime = find_workbuddy_runtime()
         reply = run_native_resolver(runtime, {"operation": "encrypt", "value": plaintext})
         val = reply.get("value")
         if isinstance(val, dict) and val.get("$wbEncrypted") == 1:
             return val
+    except CredentialError as e:
+        reason = e.reason
     except Exception:
-        pass
+        reason = "HELPER_PROTOCOL"
+    _warn_plaintext_fallback(reason)
     return plaintext
 
 def get_display_nickname(account_data, default_name=""):
@@ -1852,71 +1909,114 @@ def show_status(as_json=False):
         print(f" {tag} • {COLOR_BOLD}{name:<12}{COLOR_RESET} 昵称: {p.get('nickname', name)} (UID: {masked_uid}) [{p_fmt}] {h_badge} {exp_label}")
     print()
 
+def _linux_app_pids(app_path=None):
+    """按 /proc/<pid>/exe 精确定位 WorkBuddy 客户端进程（含 Electron 子进程）。
+
+    不使用 `pkill -f` 命令行模糊匹配：那会命中 `python3 ~/.local/bin/workbuddy switch ...`
+    这类 Toolkit 自身进程，导致切号流程在重启客户端之前就把自己 SIGTERM 掉。
+    解释器进程（python3 等）的 exe 不会是 WorkBuddy 二进制，因此天然被排除。
+    """
+    excluded = {os.getpid(), os.getppid()}
+    app_real = os.path.realpath(app_path) if app_path else None
+    pids = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return pids
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid in excluded:
+            continue
+        try:
+            exe = os.path.realpath(os.readlink(os.path.join("/proc", entry, "exe")))
+        except OSError:
+            continue
+        if app_real and exe == app_real:
+            pids.append(pid)
+        elif os.path.basename(exe) in ("workbuddy", "WorkBuddy") and not _is_toolkit_cli(exe):
+            pids.append(pid)
+    return sorted(pids)
+
+def _terminate_pids(pids, grace_seconds=5.0):
+    import signal
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.monotonic() + grace_seconds
+    alive = list(pids)
+    while alive and time.monotonic() < deadline:
+        time.sleep(0.1)
+        still = []
+        for pid in alive:
+            try:
+                os.kill(pid, 0)
+                # 已退出但未被回收的僵尸进程视为已结束
+                with open(f"/proc/{pid}/stat", "r") as f:
+                    if f.read().split(") ", 1)[-1].startswith("Z"):
+                        continue
+                still.append(pid)
+            except (OSError, IndexError):
+                pass
+        alive = still
+    for pid in alive:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+def _launch_detached(path):
+    env = {k: v for k, v in os.environ.items() if k != "ELECTRON_RUN_AS_NODE"}
+    subprocess.Popen([path], start_new_session=True, env=env,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
 def restart_workbuddy():
+    """关闭并重新启动 WorkBuddy 客户端。返回是否成功拉起客户端。"""
     print(f"{COLOR_YELLOW}正在重启 WorkBuddy 客户端以生效凭证...{COLOR_RESET}")
+    started = False
     if sys.platform == "darwin":
         try:
             subprocess.run(["osascript", "-e", 'quit app "WorkBuddy"'], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
         except Exception:
             pass
         time.sleep(1.5)
-        res = subprocess.run(["pgrep", "-f", "WorkBuddy.app"], stdout=subprocess.PIPE, text=True)
+        res = subprocess.run(["pgrep", "-f", "WorkBuddy.app/Contents/MacOS"], stdout=subprocess.PIPE, text=True)
         if res.stdout.strip():
-            subprocess.run(["pkill", "-f", "WorkBuddy.app"], stderr=subprocess.DEVNULL)
+            subprocess.run(["pkill", "-f", "WorkBuddy.app/Contents/MacOS"], stderr=subprocess.DEVNULL)
             time.sleep(1)
-        subprocess.run(["open", "-a", "WorkBuddy"])
+        started = subprocess.run(["open", "-a", "WorkBuddy"]).returncode == 0
     elif sys.platform == "win32":
         try:
             subprocess.run(["taskkill", "/f", "/im", "WorkBuddy.exe"], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
         except Exception:
             pass
         time.sleep(1.5)
-        possible_paths = [
-            os.path.expandvars(r"%LOCALAPPDATA%\Programs\workbuddy\WorkBuddy.exe"),
-            os.path.expandvars(r"%LOCALAPPDATA%\Programs\WorkBuddy\WorkBuddy.exe"),
-            os.path.expandvars(r"%PROGRAMFILES%\WorkBuddy\WorkBuddy.exe"),
-            os.path.expandvars(r"%PROGRAMFILES(X86)%\WorkBuddy\WorkBuddy.exe"),
-            shutil.which("WorkBuddy.exe"),
-            shutil.which("workbuddy.exe"),
-        ]
-        started = False
-        for p in possible_paths:
-            if p and os.path.exists(p) and os.path.isfile(p):
-                if hasattr(os, "startfile"):
-                    os.startfile(p)
-                else:
-                    subprocess.Popen([p], shell=True)
-                started = True
-                break
-        if not started:
-            subprocess.Popen(["start", "workbuddy"], shell=True)
+        try:
+            app = find_workbuddy_runtime()
+        except CredentialError:
+            app = None
+        if app:
+            os.startfile(app)
+            started = True
     else:  # Linux
         try:
-            # Linux: target desktop application specifically, avoiding matching CLI scripts or working directories
-            subprocess.run(["pkill", "-x", "workbuddy"], stderr=subprocess.DEVNULL)
-            subprocess.run(["pkill", "-f", r"/workbuddy(\s|$|/opt)"], stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
-        time.sleep(1.5)
-        possible_paths = [
-            shutil.which("workbuddy"),
-            "/usr/bin/workbuddy",
-            "/usr/local/bin/workbuddy",
-            "/opt/apps/workbuddy/workbuddy",
-            "/opt/workbuddy/workbuddy",
-            "/opt/WorkBuddy/workbuddy",
-            os.path.expanduser("~/.local/bin/workbuddy"),
-        ]
-        started = False
-        for p in possible_paths:
-            if p and os.path.exists(p) and os.path.isfile(p):
-                subprocess.Popen([p], start_new_session=True)
-                started = True
-                break
-        if not started:
-            subprocess.Popen(["workbuddy"], start_new_session=True)
+            app = find_workbuddy_runtime()
+        except CredentialError:
+            app = None
+        _terminate_pids(_linux_app_pids(app))
+        time.sleep(0.5)
+        if app:
+            _launch_detached(app)
+            started = True
 
-    print(f"{COLOR_GREEN}✔ WorkBuddy 已成功重启！{COLOR_RESET}")
+    if started:
+        print(f"{COLOR_GREEN}✔ WorkBuddy 已成功重启！{COLOR_RESET}")
+    else:
+        print(f"{COLOR_YELLOW}▲ 未找到 WorkBuddy 客户端可执行文件，请手动启动（或设置 WORKBUDDY_EXE 指向客户端）。{COLOR_RESET}")
+    return started
 
 def switch_to_profile(target_name, auto_restart=True, check_health=True):
     profiles = get_profiles()
@@ -3417,6 +3517,15 @@ def run_doctor(args=None):
 
     profiles = get_profiles()
     print(f"Profile count         : {len(profiles)}")
+    if resolver_avail or token_fmt == "sym-v1":
+        plaintext_profiles = []
+        for p_name, p in profiles.items():
+            p_auth = p["data"].get("auth") if isinstance(p.get("data"), dict) else None
+            if isinstance(p_auth, dict) and check_token_format(p_auth.get("accessToken")) == "plaintext":
+                plaintext_profiles.append(p_name)
+        if plaintext_profiles:
+            print(f"Plaintext profiles    : {COLOR_YELLOW}{len(plaintext_profiles)} ({', '.join(plaintext_profiles[:5])}; "
+                  f"stored unencrypted, re-run wb-login <alias> to encrypt){COLOR_RESET}")
 
     # 判断 API capability
     api_ready = False

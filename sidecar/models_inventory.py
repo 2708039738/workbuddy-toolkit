@@ -5,11 +5,11 @@ WorkBuddy 模型全景资产库、倍率解析、使用统计与智能排序选�
 """
 
 import os
-import sys
 import re
 import json
 import math
 import sqlite3
+import tempfile
 from typing import List, Dict, Any, Optional
 
 DEFAULT_WORKBUDDY_DIR = os.path.expanduser("~/.workbuddy")
@@ -30,6 +30,36 @@ COLOR_BLUE = "\033[34m"
 COLOR_CYAN = "\033[36m"
 COLOR_RED = "\033[31m"
 COLOR_GRAY = "\033[90m"
+
+def atomic_write_json(path: str, data: Any, mode: Optional[int] = 0o600) -> None:
+    """原子写入 JSON：同目录临时文件 + fsync + os.replace，避免半写入损坏配置。
+
+    mode=None 时沿用目标文件已有权限（用于 WorkBuddy 自己的 models.json）；
+    否则以指定权限创建（含 API Key 的路由配置默认 0600）。
+    """
+    target_dir = os.path.dirname(os.path.abspath(path))
+    os.makedirs(target_dir, exist_ok=True)
+    if mode is None:
+        try:
+            mode = os.stat(path).st_mode & 0o777
+        except OSError:
+            mode = 0o644
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=target_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.name != "nt":
+            os.chmod(tmp_path, mode)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
 
 def find_latest_dynamic_product_config(
     spill_dir: str = DEFAULT_SPILL_DIR,
@@ -295,6 +325,9 @@ def load_failover_config(config_path: str = DEFAULT_ROUTER_CONFIG) -> Dict[str, 
         "chain": []
     }
 
+# 内置上游路由表只保存端点元数据，绝不内置任何 API Key。
+# 自定义模型的真实凭据来自用户本机 ~/.workbuddy/models.json（经 get_unified_inventory 合并），
+# 或用户已有的 ~/.workbuddy/failover_router.json，均只存在于用户本地。
 DEFAULT_UPSTREAMS = {
     "space-bunny-free": {
         "id": "space-bunny-free",
@@ -302,7 +335,7 @@ DEFAULT_UPSTREAMS = {
         "source": "custom",
         "vendor": "OpenCode Zen",
         "url": "https://opencode.ai/zen/v1/chat/completions",
-        "apiKey": "sk-fWTpWfNqsiknArM9R14Muk72U1DqAMavnZLv0fcysZoLt34EMKRXUqmt4g9TVhbL",
+        "apiKey": "",
         "supportsToolCall": True,
         "supportsReasoning": True,
         "supportsImages": True
@@ -313,7 +346,7 @@ DEFAULT_UPSTREAMS = {
         "source": "custom",
         "vendor": "OpenCode Zen",
         "url": "https://opencode.ai/zen/v1/chat/completions",
-        "apiKey": "sk-fWTpWfNqsiknArM9R14Muk72U1DqAMavnZLv0fcysZoLt34EMKRXUqmt4g9TVhbL",
+        "apiKey": "",
         "supportsToolCall": True,
         "supportsReasoning": True,
         "supportsImages": False
@@ -368,7 +401,7 @@ DEFAULT_UPSTREAMS = {
         "source": "custom",
         "vendor": "Google",
         "url": "http://127.0.0.1:8045/v1",
-        "apiKey": "sk-8246df449d384693a498cb627b26432c",
+        "apiKey": "",
         "supportsToolCall": True,
         "supportsReasoning": True,
         "supportsImages": True
@@ -379,7 +412,7 @@ DEFAULT_UPSTREAMS = {
         "source": "custom",
         "vendor": "Google",
         "url": "http://127.0.0.1:8045/v1",
-        "apiKey": "sk-8246df449d384693a498cb627b26432c",
+        "apiKey": "",
         "supportsToolCall": True,
         "supportsReasoning": True,
         "supportsImages": True
@@ -390,7 +423,7 @@ DEFAULT_UPSTREAMS = {
         "source": "custom",
         "vendor": "Anthropic",
         "url": "http://127.0.0.1:8045/v1",
-        "apiKey": "sk-8246df449d384693a498cb627b26432c",
+        "apiKey": "",
         "supportsToolCall": True,
         "supportsReasoning": True,
         "supportsImages": True
@@ -401,7 +434,7 @@ DEFAULT_UPSTREAMS = {
         "source": "custom",
         "vendor": "Anthropic",
         "url": "http://127.0.0.1:8045/v1",
-        "apiKey": "sk-8246df449d384693a498cb627b26432c",
+        "apiKey": "",
         "supportsToolCall": True,
         "supportsReasoning": False,
         "supportsImages": True
@@ -484,9 +517,8 @@ def save_failover_config(
         "upstreams": upstreams
     }
 
-    os.makedirs(os.path.dirname(os.path.abspath(config_path)), exist_ok=True)
-    with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    # 配置中可能包含用户自定义上游的 API Key，必须以 0600 原子写入
+    atomic_write_json(config_path, cfg, mode=0o600)
 
 def register_virtual_model_in_models_json(
     models_json_path: str = DEFAULT_MODELS_JSON,

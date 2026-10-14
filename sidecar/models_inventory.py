@@ -6,8 +6,10 @@ WorkBuddy 模型全景资产库、倍率解析、使用统计与智能排序选�
 
 import os
 import re
+import copy
 import json
 import math
+import time
 import sqlite3
 import tempfile
 from typing import List, Dict, Any, Optional
@@ -520,6 +522,94 @@ def save_failover_config(
     # 配置中可能包含用户自定义上游的 API Key，必须以 0600 原子写入
     atomic_write_json(config_path, cfg, mode=0o600)
 
+# register_virtual_model_in_models_json 会改写的条目；首次改写前备份原值，卸载时据此还原
+MANAGED_MODEL_IDS = ("workbuddy-autopilot", "deepseek-v4.1-flash", "space-bunny-free")
+
+def _default_models_backup_path(models_json_path: str) -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(models_json_path)), "toolkit-state", "models_json_backup.json")
+
+def _points_at_local_router(entry: Dict[str, Any], port: int) -> bool:
+    url = str(entry.get("url") or "")
+    return any(f"{h}:{port}" in url for h in ("127.0.0.1", "localhost", "[::1]"))
+
+def _backup_managed_entries(current_list: List[Any], backup_path: str, port: int) -> None:
+    """只在第一次接管时备份，保证记录的是 Toolkit 介入之前的原始状态。"""
+    if os.path.exists(backup_path):
+        return
+    entries: Dict[str, Any] = {}
+    for mid in MANAGED_MODEL_IDS:
+        orig = next((m for m in current_list if isinstance(m, dict) and m.get("id") == mid), None)
+        if orig is not None and _points_at_local_router(orig, port):
+            # 旧版本 Toolkit 已改写过、原值已不可知：卸载时走启发式还原
+            entries[mid] = {"__unknown__": True}
+        else:
+            entries[mid] = copy.deepcopy(orig)
+    atomic_write_json(backup_path, {"version": 1, "created_at": int(time.time()), "entries": entries}, mode=0o600)
+
+def restore_models_json(
+    models_json_path: str = DEFAULT_MODELS_JSON,
+    backup_path: Optional[str] = None,
+    router_config_path: str = DEFAULT_ROUTER_CONFIG,
+    port: int = 8047,
+) -> Dict[str, int]:
+    """撤销 register_virtual_model_in_models_json 对 models.json 的改动（卸载时调用）。
+
+    只处理仍指向本地路由的条目，用户之后自行修改过的条目保持不动：
+    - 有备份原值 -> 还原原值；备份为"原本不存在" -> 删除；
+    - 无备份（旧版本安装）-> 用 failover_router.json 中记录的真实上游还原 url/apiKey，
+      Toolkit 自己新增的 workbuddy-autopilot / deepseek-v4.1-flash 直接删除。
+    """
+    backup_path = backup_path or _default_models_backup_path(models_json_path)
+    summary = {"restored": 0, "removed": 0, "left": 0}
+    entries: Dict[str, Any] = {}
+    try:
+        with open(backup_path, "r", encoding="utf-8") as f:
+            entries = (json.load(f) or {}).get("entries") or {}
+    except (OSError, ValueError):
+        entries = {}
+
+    try:
+        with open(models_json_path, "r", encoding="utf-8") as f:
+            current_list = json.load(f)
+    except (OSError, ValueError):
+        current_list = None
+
+    if isinstance(current_list, list):
+        upstreams = load_failover_config(router_config_path).get("upstreams", {}) or {}
+        new_list = []
+        for m in current_list:
+            if not isinstance(m, dict) or not _points_at_local_router(m, port):
+                new_list.append(m)
+                continue
+            mid = m.get("id")
+            orig = entries.get(mid, {"__unknown__": True}) if mid in entries else {"__unknown__": True}
+            if orig is None:
+                summary["removed"] += 1
+            elif not orig.get("__unknown__"):
+                new_list.append(orig)
+                summary["restored"] += 1
+            else:
+                up = upstreams.get(mid) if isinstance(upstreams, dict) else None
+                if isinstance(up, dict) and up.get("url") and not _points_at_local_router(up, port):
+                    fixed = dict(m)
+                    fixed["url"] = up["url"]
+                    fixed["apiKey"] = up.get("apiKey", "")
+                    new_list.append(fixed)
+                    summary["restored"] += 1
+                elif mid in ("workbuddy-autopilot", "deepseek-v4.1-flash"):
+                    summary["removed"] += 1
+                else:
+                    new_list.append(m)
+                    summary["left"] += 1
+        if summary["restored"] or summary["removed"]:
+            atomic_write_json(models_json_path, new_list, mode=None)
+
+    try:
+        os.remove(backup_path)
+    except OSError:
+        pass
+    return summary
+
 def _resolve_router_token(models_json_path: str) -> str:
     """路由鉴权 Token 与 models.json 同目录（生产环境即 ~/.workbuddy/router_token）。"""
     import router_engine  # 同在 sidecar 目录
@@ -531,6 +621,7 @@ def register_virtual_model_in_models_json(
     models_json_path: str = DEFAULT_MODELS_JSON,
     port: int = 8047,
     token: Optional[str] = None,
+    backup_path: Optional[str] = None,
 ):
     """
     在 ~/.workbuddy/models.json 中配置模型接入点：
@@ -551,6 +642,8 @@ def register_virtual_model_in_models_json(
                     current_list = []
         except Exception:
             current_list = []
+
+    _backup_managed_entries(current_list, backup_path or _default_models_backup_path(models_json_path), port)
 
     # 1. workbuddy-autopilot
     autopilot_entry = {

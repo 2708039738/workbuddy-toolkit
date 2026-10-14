@@ -27,6 +27,9 @@ import urllib.request
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Tuple
 
+# 与 bin/workbuddy 中 SESSION_OWNER_BACKUP_TABLE 保持一致
+SESSION_OWNER_BACKUP_TABLE = "wbtk_session_owner_backup"
+
 # ANSI terminal colors (strictly disabled in non-TTY or plain mode)
 BOLD = "\033[1m"
 DIM = "\033[2m"
@@ -524,6 +527,15 @@ class CreditMeter:
                 cur.execute("SELECT id, user_id FROM sessions WHERE user_id != '' AND user_id IS NOT NULL")
                 for sid, uid in cur.fetchall():
                     if sid and uid:
+                        session_owner[str(sid)] = str(uid)
+            except Exception:
+                pass
+            try:
+                # `workbuddy init` 置空 user_id 前会把原始归属写入旁路备份表，共享模式下据此归因
+                cur = conn.cursor()
+                cur.execute(f"SELECT session_id, user_id FROM {SESSION_OWNER_BACKUP_TABLE}")
+                for sid, uid in cur.fetchall():
+                    if sid and uid and str(sid) not in session_owner:
                         session_owner[str(sid)] = str(uid)
             except Exception:
                 pass

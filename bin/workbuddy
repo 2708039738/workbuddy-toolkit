@@ -813,63 +813,161 @@ def sync_active_token_to_profiles():
             except Exception:
                 pass
 
+SESSION_OWNER_BACKUP_TABLE = "wbtk_session_owner_backup"
+AUTOMATION_OWNER_BACKUP_TABLE = "wbtk_automation_owner_backup"
+
+def _shared_workspace_sql():
+    """开启多账号工作区共享所需的 SQL（与 sql/install_triggers.sql 保持一致）。
+
+    在把 sessions.user_id 置空之前，先把原始归属写入旁路备份表；触发器同样先备份再置空。
+    这样 `workbuddy rollback` 可以把每个会话恢复到真正的原账号，而不是统一挂到某一个 UID 下。
+    """
+    t = SESSION_OWNER_BACKUP_TABLE
+    now = "CAST(strftime('%s','now') AS INTEGER)"
+    return [
+        f"CREATE TABLE IF NOT EXISTS {t} (session_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, saved_at INTEGER NOT NULL)",
+        f"INSERT OR REPLACE INTO {t} (session_id, user_id, saved_at) "
+        f"SELECT id, user_id, {now} FROM sessions WHERE user_id IS NOT NULL AND user_id != ''",
+        "UPDATE sessions SET user_id = '' WHERE user_id IS NOT NULL AND user_id != ''",
+        # 旧版本触发器不备份归属：先删除再以新定义重建
+        "DROP TRIGGER IF EXISTS trg_sessions_force_shared_insert",
+        "DROP TRIGGER IF EXISTS trg_sessions_force_shared_update",
+        f"""CREATE TRIGGER trg_sessions_force_shared_insert
+        AFTER INSERT ON sessions
+        WHEN NEW.user_id != '' AND NEW.user_id IS NOT NULL
+        BEGIN
+            INSERT OR REPLACE INTO {t} (session_id, user_id, saved_at) VALUES (NEW.id, NEW.user_id, {now});
+            UPDATE sessions SET user_id = '' WHERE id = NEW.id;
+        END""",
+        f"""CREATE TRIGGER trg_sessions_force_shared_update
+        AFTER UPDATE OF user_id ON sessions
+        WHEN NEW.user_id != '' AND NEW.user_id IS NOT NULL
+        BEGIN
+            INSERT OR REPLACE INTO {t} (session_id, user_id, saved_at) VALUES (NEW.id, NEW.user_id, {now});
+            UPDATE sessions SET user_id = '' WHERE id = NEW.id;
+        END""",
+    ]
+
+def _table_exists(cur, name):
+    cur.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,))
+    return cur.fetchone() is not None
+
 def init_shared_workspace():
-    """Inject SQLite triggers so all accounts share workspace sessions seamlessly."""
+    """Inject SQLite triggers so all accounts share workspace sessions (reversible via rollback)."""
     if not os.path.exists(DB_FILE):
         print(f"{COLOR_RED}错误: 未找到 WorkBuddy 数据库 ({DB_FILE}){COLOR_RESET}")
         return False
 
-    print(f"正在配置数据库以支持多账号工作区互通...")
+    print("正在配置数据库以支持多账号工作区互通...")
+    con = None
     try:
-        con = sqlite3.connect(DB_FILE)
+        con = sqlite3.connect(DB_FILE, timeout=10.0)
         cur = con.cursor()
-        
-        # 1. 统一历史会话 user_id 为 ''
-        cur.execute("UPDATE sessions SET user_id = '' WHERE user_id IS NOT NULL AND user_id != '';")
-        
-        # 2. 建立共享触发器
-        cur.execute("""
-        CREATE TRIGGER IF NOT EXISTS trg_sessions_force_shared_insert
-        AFTER INSERT ON sessions
-        WHEN NEW.user_id != '' AND NEW.user_id IS NOT NULL
-        BEGIN
-            UPDATE sessions SET user_id = '' WHERE id = NEW.id;
-        END;
-        """)
-        cur.execute("""
-        CREATE TRIGGER IF NOT EXISTS trg_sessions_force_shared_update
-        AFTER UPDATE OF user_id ON sessions
-        WHEN NEW.user_id != '' AND NEW.user_id IS NOT NULL
-        BEGIN
-            UPDATE sessions SET user_id = '' WHERE id = NEW.id;
-        END;
-        """)
+        for stmt in _shared_workspace_sql():
+            cur.execute(stmt)
         con.commit()
-        con.close()
-        print(f"{COLOR_GREEN}✔ 全域会话共享触发器已成功激活！所有账号将共享相同的工作区和历史记录。{COLOR_RESET}")
+        cur.execute(f"SELECT COUNT(*) FROM {SESSION_OWNER_BACKUP_TABLE}")
+        backed_up = cur.fetchone()[0]
+        print(f"{COLOR_GREEN}✔ 全域会话共享触发器已激活！所有账号将共享相同的工作区和历史记录。{COLOR_RESET}")
+        print(f"  已备份 {backed_up} 个会话的原始账号归属，可随时运行 {COLOR_BOLD}workbuddy rollback{COLOR_RESET} 恢复。")
         return True
     except Exception as e:
+        if con is not None:
+            con.rollback()
         print(f"{COLOR_RED}配置失败: {e}{COLOR_RESET}")
         return False
+    finally:
+        if con is not None:
+            con.close()
 
 def rollback_shared_workspace(restore_uid=None):
-    """Remove SQLite triggers and optionally re-isolate sessions."""
+    """Remove sharing triggers and restore per-account session / automation ownership.
+
+    - 有备份记录的会话恢复到原始 user_id；
+    - restore_uid 只用于没有备份记录的会话（例如旧版本 init 时就已被清空的历史会话）；
+    - 切号时被改写的 automations.owner_user_id 同样恢复。
+    """
     if not os.path.exists(DB_FILE):
         return False
+    con = None
     try:
-        con = sqlite3.connect(DB_FILE)
+        con = sqlite3.connect(DB_FILE, timeout=10.0)
         cur = con.cursor()
         cur.execute("DROP TRIGGER IF EXISTS trg_sessions_force_shared_insert;")
         cur.execute("DROP TRIGGER IF EXISTS trg_sessions_force_shared_update;")
+
+        restored = 0
+        if _table_exists(cur, SESSION_OWNER_BACKUP_TABLE):
+            cur.execute(
+                f"UPDATE sessions SET user_id = (SELECT b.user_id FROM {SESSION_OWNER_BACKUP_TABLE} b WHERE b.session_id = sessions.id) "
+                f"WHERE (user_id IS NULL OR user_id = '') AND id IN (SELECT session_id FROM {SESSION_OWNER_BACKUP_TABLE})"
+            )
+            restored = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            cur.execute(f"DROP TABLE {SESSION_OWNER_BACKUP_TABLE}")
+
+        assigned = 0
         if restore_uid:
             cur.execute("UPDATE sessions SET user_id = ? WHERE user_id = '';", (restore_uid,))
+            assigned = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+        automations_restored = 0
+        if _table_exists(cur, AUTOMATION_OWNER_BACKUP_TABLE):
+            if _table_exists(cur, "automations"):
+                cur.execute(
+                    f"UPDATE automations SET owner_user_id = (SELECT b.owner_user_id FROM {AUTOMATION_OWNER_BACKUP_TABLE} b "
+                    f"WHERE b.automation_id = automations.id) WHERE id IN (SELECT automation_id FROM {AUTOMATION_OWNER_BACKUP_TABLE})"
+                )
+                automations_restored = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            cur.execute(f"DROP TABLE {AUTOMATION_OWNER_BACKUP_TABLE}")
+
+        cur.execute("SELECT COUNT(*) FROM sessions WHERE user_id = ''")
+        orphaned = cur.fetchone()[0]
         con.commit()
-        con.close()
+
         print(f"{COLOR_GREEN}✔ 共享触发器已移除，已恢复单账号数据隔离。{COLOR_RESET}")
+        print(f"  已恢复 {restored} 个会话的原始归属" + (f"，{assigned} 个会话归属到 {restore_uid}" if restore_uid else "")
+              + (f"，{automations_restored} 个自动化任务的原始所有者" if automations_restored else "") + "。")
+        if orphaned:
+            print(f"{COLOR_YELLOW}▲ 仍有 {orphaned} 个会话没有可恢复的原始归属（通常是旧版本 init 时就已被清空），"
+                  f"在各账号下都会可见。如需归属到指定账号: workbuddy rollback <UID>{COLOR_RESET}")
         return True
     except Exception as e:
+        if con is not None:
+            con.rollback()
         print(f"{COLOR_RED}回滚失败: {e}{COLOR_RESET}")
         return False
+    finally:
+        if con is not None:
+            con.close()
+
+def reassign_automations_owner(target_uid):
+    """切号时把未删除的自动化任务归属到当前账号；首次改写前备份原始所有者以便 rollback 恢复。"""
+    if not os.path.exists(DB_FILE) or not target_uid:
+        return False
+    con = None
+    try:
+        con = sqlite3.connect(DB_FILE, timeout=10.0)
+        cur = con.cursor()
+        if not _table_exists(cur, "automations"):
+            return False
+        cur.execute(
+            f"CREATE TABLE IF NOT EXISTS {AUTOMATION_OWNER_BACKUP_TABLE} "
+            f"(automation_id TEXT PRIMARY KEY, owner_user_id TEXT, saved_at INTEGER NOT NULL)"
+        )
+        cur.execute(
+            f"INSERT OR IGNORE INTO {AUTOMATION_OWNER_BACKUP_TABLE} (automation_id, owner_user_id, saved_at) "
+            f"SELECT id, owner_user_id, CAST(strftime('%s','now') AS INTEGER) FROM automations WHERE deleted_at IS NULL"
+        )
+        cur.execute("UPDATE automations SET owner_user_id = ? WHERE deleted_at IS NULL;", (target_uid,))
+        con.commit()
+        return True
+    except Exception:
+        if con is not None:
+            con.rollback()
+        return False
+    finally:
+        if con is not None:
+            con.close()
 
 # ==============================================================================
 # Terminal QR Code Generator (Pure-Python Zero-Dependency Implementation)
@@ -2018,19 +2116,55 @@ def restart_workbuddy():
         print(f"{COLOR_YELLOW}▲ 未找到 WorkBuddy 客户端可执行文件，请手动启动（或设置 WORKBUDDY_EXE 指向客户端）。{COLOR_RESET}")
     return started
 
+UID_PREFIX_MIN_LEN = 4
+
+def resolve_profile_target(profiles, query, allow_uid_prefix=True, quiet=False):
+    """把用户输入解析为唯一的 Profile。返回 (alias, profile)，找不到或有歧义时返回 (None, None)。
+
+    优先级：精确别名 > 精确昵称 > 精确 UID > 唯一 UID 前缀（至少 4 位）。
+    同一优先级命中多个不同账号时拒绝猜测，并列出候选，避免"切到另一个账号"。
+    """
+    q = str(query or "").strip()
+    if not q or not profiles:
+        return None, None
+    ql = q.lower()
+
+    def _unique(names, level):
+        if not names:
+            return None
+        uids = {profiles[n].get("uid") or n for n in names}
+        if len(uids) == 1:
+            return names[0]
+        if not quiet:
+            listing = ", ".join(f"{n} (UID {str(profiles[n].get('uid') or '')[:8]}...)" for n in names)
+            print(f"{COLOR_RED}错误: '{q}' 按{level}匹配到多个账号: {listing}。请使用唯一的账号别名。{COLOR_RESET}")
+        return False
+
+    if q in profiles:
+        return q, profiles[q]
+    levels = [
+        ([n for n in profiles if n.lower() == ql], "别名"),
+        ([n for n, p in profiles.items() if str(p.get("nickname") or "").lower() == ql], "昵称"),
+        ([n for n, p in profiles.items() if p.get("uid") and str(p["uid"]) == q], "UID"),
+    ]
+    if allow_uid_prefix and len(q) >= UID_PREFIX_MIN_LEN:
+        levels.append(([n for n, p in profiles.items() if p.get("uid") and str(p["uid"]).startswith(q)], "UID 前缀"))
+    for names, level in levels:
+        hit = _unique(names, level)
+        if hit is False:
+            return None, None
+        if hit:
+            return hit, profiles[hit]
+    return None, None
+
 def switch_to_profile(target_name, auto_restart=True, check_health=True):
     profiles = get_profiles()
-    target = None
-    for name, p in profiles.items():
-        if name.lower() == target_name.lower() or p["nickname"].lower() == target_name.lower() or p["uid"].startswith(target_name):
-            target = p
-            target_name = name
-            break
-
+    matched_name, target = resolve_profile_target(profiles, target_name)
     if not target:
-        print(f"{COLOR_RED}错误: 未找到名为 '{target_name}' 的账号凭证。{COLOR_RESET}")
+        print(f"{COLOR_RED}错误: 未找到唯一匹配 '{target_name}' 的账号凭证。{COLOR_RESET}")
         print(f"可用账号列表: {', '.join(profiles.keys())}")
         return False
+    target_name = matched_name
 
     if check_health:
         health = check_profile_health(target, force=False)
@@ -2095,15 +2229,7 @@ def switch_to_profile(target_name, auto_restart=True, check_health=True):
         except Exception:
             pass
 
-    if os.path.exists(DB_FILE):
-        try:
-            con = sqlite3.connect(DB_FILE)
-            cur = con.cursor()
-            cur.execute("UPDATE automations SET owner_user_id = ? WHERE deleted_at IS NULL;", (target["uid"],))
-            con.commit()
-            con.close()
-        except Exception:
-            pass
+    reassign_automations_owner(target["uid"])
 
     print(f"{COLOR_GREEN}✔ 凭证已成功切换至: {target_name} ({target['nickname']}) (免扫码生效){COLOR_RESET}")
 
@@ -2180,15 +2306,11 @@ def run_chat(target_name=None, prompt="请回复：你好", model=None, send_all
     profiles = get_profiles()
 
     targets = {}
+    resolved_name, resolved_prof = resolve_profile_target(profiles, target_name, allow_uid_prefix=False, quiet=True) if target_name else (None, None)
     if send_all:
         targets = profiles
-    elif target_name and target_name in profiles:
-        targets[target_name] = profiles[target_name]
-    elif target_name and any(p["nickname"].lower() == target_name.lower() for p in profiles.values()):
-        for name, p in profiles.items():
-            if p["nickname"].lower() == target_name.lower():
-                targets[name] = p
-                break
+    elif resolved_prof:
+        targets[resolved_name] = resolved_prof
     else:
         if target_name:
             prompt = target_name
@@ -2280,7 +2402,7 @@ def parse_and_run_chat(args):
     profiles = get_profiles()
     if rem_args:
         first = rem_args[0]
-        if first in profiles or any(p["nickname"].lower() == first.lower() for p in profiles.values()):
+        if resolve_profile_target(profiles, first, allow_uid_prefix=False, quiet=True)[1]:
             target_name = first
             rem_args = rem_args[1:]
 
@@ -2417,13 +2539,11 @@ def run_checkin(target_name=None, with_chat=True):
 
     targets = {}
     if target_name:
-        for name, p in profiles.items():
-            if name.lower() == target_name.lower() or p["nickname"].lower() == target_name.lower():
-                targets[name] = p
-                break
-        if not targets:
+        t_name, t_prof = resolve_profile_target(profiles, target_name, allow_uid_prefix=False)
+        if not t_prof:
             print(f"{COLOR_RED}未找到账号: {target_name}{COLOR_RESET}")
             return
+        targets[t_name] = t_prof
     else:
         targets = profiles
 
@@ -3767,8 +3887,8 @@ def run_router_cmd(args):
         plist_path = os.path.expanduser("~/Library/LaunchAgents/com.workbuddy.failover-router.plist")
         if os.path.exists(plist_path):
             subprocess.run(["launchctl", "unload", plist_path], capture_output=True)
-        subprocess.run(["pkill", "-f", "router_engine.py"], capture_output=True)
-        subprocess.run(["pkill", "-f", "failover-router"], capture_output=True)
+        if sys.platform != "win32":
+            subprocess.run(["pkill", "-f", "sidecar/router_engine.py"], capture_output=True)
         print(f"{COLOR_GREEN}✔ Failover Router 服务已停止。{COLOR_RESET}")
     elif action == "restart":
         run_router_cmd(["stop"])
@@ -4179,8 +4299,10 @@ def main():
         print_help()
     else:
         profiles = get_profiles()
-        if cmd in profiles or any(p["nickname"].lower() == cmd for p in profiles.values()):
-            switch_to_profile(cmd, auto_restart=True)
+        # `workbuddy <别名|昵称>` 快捷切换：只接受精确匹配，避免拼错的命令被当成 UID 前缀切号
+        shortcut_name, _ = resolve_profile_target(profiles, args[0], allow_uid_prefix=False, quiet=True)
+        if shortcut_name:
+            switch_to_profile(shortcut_name, auto_restart=True)
         else:
             print(f"{COLOR_RED}未知命令或账号: {cmd}{COLOR_RESET}")
             print_help()

@@ -378,7 +378,6 @@ class TestFailoverRouter(unittest.TestCase):
         self.assertIn(b"Hello", body)
 
     def test_12_oversized_body_is_rejected(self):
-        url = f"http://127.0.0.1:{self.router_port}/v1/chat/completions"
         s = socket.create_connection(("127.0.0.1", self.router_port), timeout=3)
         try:
             s.sendall((f"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n"

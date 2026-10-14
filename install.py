@@ -116,7 +116,7 @@ def parse_options(argv):
     interactive = sys.stdin.isatty() and "--no-input" not in argv
     if interactive:
         print(f"\n{COLOR_BOLD}以下能力默认关闭，可按需开启 (直接回车 = 否):{COLOR_RESET}")
-        for key, flag, desc in OPTIONAL_FEATURES:
+        for key, _flag, desc in OPTIONAL_FEATURES:
             if key in explicit:
                 continue
             try:

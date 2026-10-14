@@ -88,8 +88,8 @@ def get_open_files(directory):
 
 def truncate_file(filepath):
     try:
-        with open(filepath, 'w') as f:
-            pass # Truncate to 0
+        with open(filepath, 'w'):
+            pass  # Truncate to 0
         return True
     except Exception:
         return False
@@ -165,7 +165,7 @@ def clean_session_snapshots(sessions_dir, open_files_set=None, ttl_hours=72, max
     # Sort descending: newest sessions first
     sessions.sort(key=lambda x: x[0], reverse=True)
 
-    for idx, (mtime, sp, item) in enumerate(sessions):
+    for idx, (mtime, sp, _item) in enumerate(sessions):
         # Keep the most recent active sessions unless older than TTL
         is_older_than_ttl = (now - mtime) > ttl_seconds
         exceeds_keep = (idx >= max_keep)
@@ -748,7 +748,7 @@ def heal_sandbox_center_rules(socket_path=None, uid=None, session_id=None):
                     pruned_sessions.append({
                         "sessionId": sid,
                         "pruned_rules": auto_grant_count + temp_count,
-                        "success": bool(del_ag and del_ag.get("success"))
+                        "success": bool(del_ag and del_ag.get("success") and del_tmp and del_tmp.get("success"))
                     })
 
         # 3. Readback verification (锁内回读校验与断言)
@@ -1039,11 +1039,10 @@ def main():
 
     # 2. TTL Cleanup for sandbox
     if os.path.exists(SANDBOX_DIR):
-        for dirpath, dirnames, filenames in os.walk(SANDBOX_DIR):
+        for dirpath, _dirnames, filenames in os.walk(SANDBOX_DIR):
             dir_basename = os.path.basename(dirpath)
             for f in filenames:
                 fp = os.path.join(dirpath, f)
-                real_fp = os.path.realpath(fp)
                 try:
                     mtime = os.path.getmtime(fp)
                     if now - mtime > ttl_seconds:
@@ -1070,12 +1069,11 @@ def main():
                         pass
             all_files.sort(key=lambda x: x[0])
             
-            for mtime, fp, dir_basename in all_files:
+            for _mtime, fp, dir_basename in all_files:
                 if current_size <= target_sandbox_bytes:
                     break
                 try:
                     size = os.path.getsize(fp)
-                    real_fp = os.path.realpath(fp)
                     if is_file_open(fp, open_files):
                         if os.name != 'nt':
                             if truncate_file(fp):
@@ -1088,13 +1086,12 @@ def main():
 
     # 4. Other log dir cleanup
     if os.path.exists(LOG_DIR):
-        for dirpath, dirnames, filenames in os.walk(LOG_DIR, topdown=False):
+        for dirpath, _dirnames, filenames in os.walk(LOG_DIR, topdown=False):
             # Skip root log dir and sandbox dir correctly
             if dirpath == LOG_DIR or dirpath.startswith(os.path.join(SANDBOX_DIR, "")) or dirpath == SANDBOX_DIR:
                 continue
             for f in filenames:
                 fp = os.path.join(dirpath, f)
-                real_fp = os.path.realpath(fp)
                 try:
                     if now - os.path.getmtime(fp) > ttl_seconds:
                         if is_file_open(fp, open_files):
@@ -1114,7 +1111,7 @@ def main():
     # 5. Clean traces directory (24 hours TTL)
     traces_ttl = 24 * 3600
     if os.path.exists(TRACES_DIR):
-        for dirpath, dirnames, filenames in os.walk(TRACES_DIR, topdown=False):
+        for dirpath, _dirnames, filenames in os.walk(TRACES_DIR, topdown=False):
             for f in filenames:
                 fp = os.path.join(dirpath, f)
                 try:

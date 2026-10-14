@@ -520,9 +520,17 @@ def save_failover_config(
     # 配置中可能包含用户自定义上游的 API Key，必须以 0600 原子写入
     atomic_write_json(config_path, cfg, mode=0o600)
 
+def _resolve_router_token(models_json_path: str) -> str:
+    """路由鉴权 Token 与 models.json 同目录（生产环境即 ~/.workbuddy/router_token）。"""
+    import router_engine  # 同在 sidecar 目录
+    return router_engine.load_or_create_router_token(
+        os.path.join(os.path.dirname(os.path.abspath(models_json_path)), "router_token")
+    )
+
 def register_virtual_model_in_models_json(
     models_json_path: str = DEFAULT_MODELS_JSON,
-    port: int = 8047
+    port: int = 8047,
+    token: Optional[str] = None,
 ):
     """
     在 ~/.workbuddy/models.json 中配置模型接入点：
@@ -530,7 +538,9 @@ def register_virtual_model_in_models_json(
     2. 将 space-bunny-free 的 url 重定向至 8047 本地路由（真实上游已留存至 failover_router.json）
     3. 注册通用备用池 workbuddy-autopilot
     4. 保留用户原有的其他自定义模型 (Gemini, Claude, LongCat 等)
+    指向本地路由的条目使用每台机器独立生成的路由 Token 作为 apiKey，路由据此鉴权。
     """
+    router_key = token or _resolve_router_token(models_json_path)
     if not os.path.exists(models_json_path):
         current_list = []
     else:
@@ -548,7 +558,7 @@ def register_virtual_model_in_models_json(
         "name": "Auto Pilot (自动容灾轮换池)",
         "vendor": "FailoverRouter",
         "url": f"http://127.0.0.1:{port}/v1",
-        "apiKey": "sk-workbuddy-router-local",
+        "apiKey": router_key,
         "supportsToolCall": True,
         "supportsImages": True,
         "supportsReasoning": True,
@@ -565,7 +575,7 @@ def register_virtual_model_in_models_json(
         "name": "DeepSeek V4.1 Flash (无感容灾)",
         "vendor": "DeepSeek",
         "url": f"http://127.0.0.1:{port}/v1",
-        "apiKey": "sk-workbuddy-router-local",
+        "apiKey": router_key,
         "supportsToolCall": True,
         "supportsImages": True,
         "supportsReasoning": True,
@@ -594,10 +604,10 @@ def register_virtual_model_in_models_json(
     for m in current_list:
         if m.get("id") == "space-bunny-free":
             m["url"] = f"http://127.0.0.1:{port}/v1"
-            m["apiKey"] = "sk-workbuddy-router-local"
+            m["apiKey"] = router_key
 
-    with open(models_json_path, "w", encoding="utf-8") as f:
-        json.dump(current_list, f, indent=2, ensure_ascii=False)
+    # models.json 属于 WorkBuddy：原子写入并保留其原有权限（新建时 0600，因其中含 apiKey）
+    atomic_write_json(models_json_path, current_list, mode=None if os.path.exists(models_json_path) else 0o600)
 
 def print_model_table(inventory: List[Dict[str, Any]], active_chain: Optional[List[str]] = None):
     """格式化打印模型清单与梯队列表"""

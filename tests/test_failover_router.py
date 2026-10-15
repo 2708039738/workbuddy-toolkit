@@ -359,23 +359,48 @@ class TestFailoverRouter(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 403)
 
     def test_11_client_error_does_not_cool_down_chain(self):
-        self.router.clear_cooldown("model-primary")
-        self.router.clear_cooldown("model-secondary")
-        self.upstream1.set_mode("bad_request_400")
-        self.upstream2.set_mode("bad_request_400")
-        bad = {"model": "workbuddy-autopilot", "stream": True, "messages": "not-an-array"}
-        code, body = self._post(bad, AUTH_HEADERS)
-        self.assertEqual(code, 400, "调用方请求错误应原样返回 4xx，而不是 503")
-        self.assertIn(b"messages must be an array", body)
-        self.assertFalse(self.router.is_in_cooldown("model-primary"))
-        self.assertFalse(self.router.is_in_cooldown("model-secondary"))
+        # 使用独立的上游与路由：共享的单线程 mock 里可能还挂着前面用例的 hang 请求，
+        # 那会让本用例的首包超时（真实上游故障）并返回 503，从而掩盖要验证的 4xx 语义。
+        up_a, up_b = MockServer(mode="bad_request_400"), MockServer(mode="bad_request_400")
+        port = find_free_port()
+        router = router_engine.FailoverRouterServer({
+            "port": port, "cooldown_seconds": 60, "auth_token": ROUTER_TOKEN,
+            "fast_model_timeout_seconds": 3, "thinking_model_timeout_seconds": 3,
+            "chain": [
+                {"id": "iso-a", "url": f"http://127.0.0.1:{up_a.port}/v1/chat/completions"},
+                {"id": "iso-b", "url": f"http://127.0.0.1:{up_b.port}/v1/chat/completions"},
+            ],
+        }, config_path=None)
+        router.start(port=port)
+        time.sleep(0.1)
 
-        # 紧接着的正常请求必须成功
-        self.upstream1.set_mode("success_stream")
-        good = {"model": "workbuddy-autopilot", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
-        code, body = self._post(good, AUTH_HEADERS)
-        self.assertEqual(code, 200)
-        self.assertIn(b"Hello", body)
+        def post(payload):
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
+                                         data=json.dumps(payload).encode("utf-8"), headers=AUTH_HEADERS)
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    return resp.status, resp.read()
+            except urllib.error.HTTPError as e:
+                return e.code, e.read()
+
+        try:
+            bad = {"model": "workbuddy-autopilot", "stream": True, "messages": "not-an-array"}
+            code, body = post(bad)
+            self.assertEqual(code, 400, "调用方请求错误应原样返回 4xx，而不是 503")
+            self.assertIn(b"messages must be an array", body)
+            self.assertFalse(router.is_in_cooldown("iso-a"))
+            self.assertFalse(router.is_in_cooldown("iso-b"))
+
+            # 紧接着的正常请求必须成功
+            up_a.set_mode("success_stream")
+            good = {"model": "workbuddy-autopilot", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+            code, body = post(good)
+            self.assertEqual(code, 200)
+            self.assertIn(b"Hello", body)
+        finally:
+            router.stop()
+            up_a.stop()
+            up_b.stop()
 
     def test_12_oversized_body_is_rejected(self):
         s = socket.create_connection(("127.0.0.1", self.router_port), timeout=3)

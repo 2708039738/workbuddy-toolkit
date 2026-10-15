@@ -107,25 +107,40 @@ class TestLogGuard(unittest.TestCase):
         self.assertEqual(os.path.getsize(normal_log), normal_size)
         self.assertEqual(os.path.getsize(other_file), 2000)
 
-    def test_clean_runaway_temp_logs_windows_locked_skip(self):
+    def test_clean_runaway_temp_logs_windows_semantics(self):
+        """Windows: 没有进程持有的文件视为静止，跳过；被持有但写入方独占锁导致截断失败时，同样安全跳过。"""
         original_name = os.name
         os.name = "nt"
         temp_watch = os.path.join(self.temp_dir, "mock_tmp_win")
         os.makedirs(temp_watch, exist_ok=True)
-        locked_log = os.path.join(temp_watch, "locked_runaway.log")
-        with open(locked_log, "w") as f:
+        log = os.path.join(temp_watch, "runaway.log")
+        with open(log, "w") as f:
             f.write("E" * 2000)
 
         original_is_file_open = self.guard.is_file_open
-        self.guard.is_file_open = lambda fp, ofs: True
-
+        original_truncate = self.guard.truncate_file
         try:
+            # 1. 无人持有 -> 静止文件，不截断
+            self.guard.is_file_open = lambda fp, ofs: False
             cleaned, freed = self.guard.clean_runaway_temp_logs([temp_watch], max_temp_file_mb=0.0005)
-            self.assertEqual(cleaned, 0)
-            self.assertEqual(freed, 0)
-            self.assertEqual(os.path.getsize(locked_log), 2000)
+            self.assertEqual((cleaned, freed), (0, 0))
+            self.assertEqual(os.path.getsize(log), 2000)
+
+            # 2. 被持有但写入方独占锁 -> 截断失败，安全跳过
+            self.guard.is_file_open = lambda fp, ofs: True
+            self.guard.truncate_file = lambda fp: False
+            cleaned, freed = self.guard.clean_runaway_temp_logs([temp_watch], max_temp_file_mb=0.0005)
+            self.assertEqual((cleaned, freed), (0, 0))
+            self.assertEqual(os.path.getsize(log), 2000)
+
+            # 3. 被持有且可截断 -> 截断
+            self.guard.truncate_file = original_truncate
+            cleaned, _ = self.guard.clean_runaway_temp_logs([temp_watch], max_temp_file_mb=0.0005)
+            self.assertEqual(cleaned, 1)
+            self.assertEqual(os.path.getsize(log), 0)
         finally:
             self.guard.is_file_open = original_is_file_open
+            self.guard.truncate_file = original_truncate
             os.name = original_name
 
     def test_clean_bundle_migration_cache_stale(self):

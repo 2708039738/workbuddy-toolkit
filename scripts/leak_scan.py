@@ -23,7 +23,7 @@ from typing import List, Tuple
 PATTERNS: List[Tuple[str, str]] = [
     # 个人主机路径
     (r"/Users/(?!runner\b)[a-zA-Z0-9_\-]+", "macOS local user home path"),
-    (r"C:\\\\Users\\\\(?!runneradmin\b)[a-zA-Z0-9_\-]+", "Windows local user home path"),
+    (r"C:\\Users\\(?!runneradmin\b)[a-zA-Z0-9_\-]+", "Windows local user home path"),
     (r"/home/(?!runner\b)[a-zA-Z0-9_\-]+", "Linux local user home path"),
     # 令牌与 API Key
     (r"eyJh[A-Za-z0-9_\-\.]{25,}", "JWT Bearer token"),

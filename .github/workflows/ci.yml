@@ -38,7 +38,7 @@ jobs:
 
       - name: Run Automated Test Suite
         run: |
-          python -m unittest discover -s tests -v
+          python scripts/ci_test_report.py tests
 
       - name: Test Native Shell Installer (Linux / macOS)
         if: runner.os != 'Windows'

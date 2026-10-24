@@ -4259,14 +4259,17 @@ def _sync_memory_on_switch(target):
     except Exception as e:
         print(f"{COLOR_YELLOW}  [记忆] 汇总失败（已忽略，不影响切号）: {e}{COLOR_RESET}")
 
-MEMORY_USAGE = ("用法: workbuddy memory [collect | apply [账号] [--budget N] | rebalance [账号] [--apply] "
-                "| forget <关键词> [--apply] | conflicts | status | restore <账号> | on | off] [--json]")
+MEMORY_USAGE = ("用法: workbuddy memory [collect | compact [--shard-min N] | apply [账号] [--budget N] "
+                "| rebalance [账号] [--apply] | forget <关键词> [--apply] | conflicts | status "
+                "| restore <账号> | on | off] [--json]")
 
 def run_memory_cmd(args_list):
     """`workbuddy memory` 子命令入口。退出码: 0 成功，1 失败，2 参数缺失。"""
     if any(a in ("-h", "--help", "help") for a in args_list):
         print(MEMORY_USAGE)
         print("  collect        汇总所有账号 MEMORY.md，去重并保留质量更优的版本")
+        print("  compact        给超长/偏好类条目建分片，只在窗口里留一行索引")
+        print("                 --shard-min N 超过 N 字的条目才建分片（默认 120）")
         print("  apply [账号]   把共享记忆渲染进指定账号（省略则全部）；原文只追加不改写")
         print("                 --budget N 限制共享段落占用字数（默认 800，给原文留位置）")
         print("  rebalance      把 MEMORY.md 的准则/画像分流到 SOUL/USER（10k 通道），默认只出计划")
@@ -4285,7 +4288,7 @@ def run_memory_cmd(args_list):
 
     # 选项与位置参数分开解析：`apply --budget 500 alpha` 里，alpha 才是账号
     opts, positionals = {}, []
-    valued = ("--budget", "--target", "--max-level")
+    valued = ("--budget", "--target", "--max-level", "--shard-min")
     i = 0
     while i < len(clean):
         arg = clean[i]
@@ -4370,6 +4373,19 @@ def run_memory_cmd(args_list):
                     print(f"    {COLOR_CYAN}以上为计划，未写入；加 --apply 执行（执行前自动备份）{COLOR_RESET}")
         return 0
 
+    if action in ("compact", "shard"):
+        shard_min = _int_opt("shard-min", ms.SHARD_MIN_CHARS)
+        res = ms.compact(root=root, shard_min=shard_min)
+        if as_json:
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+        else:
+            print(f"{COLOR_GREEN}✔ 索引完成{COLOR_RESET}")
+            print(f"  分片 {res['shards']} 个（新写 {res['written']} 个）| "
+                  f"索引 {res['indexed']} 条 | 未达阈值 {res['skipped']} 条")
+            print(f"  分片目录: {ms.shard_dir(root)}")
+            print(f"{COLOR_CYAN}  原文完整留在分片里，MEMORY.md 只注入一行索引{COLOR_RESET}")
+        return 0 if res.get("ok") else 1
+
     if action in ("collect", "merge"):
         stats = ms.collect(accounts, root=root)
         if as_json:
@@ -4412,7 +4428,8 @@ def run_memory_cmd(args_list):
                 if not r.get("ok"):
                     print(f"  {r['alias']}: 跳过（{r['action']}）")
                 elif r["action"] == "unchanged":
-                    print(f"  {r['alias']}: 已是最新（共享 {r['shared']} 条）")
+                    print(f"  {r['alias']}: 已是最新（共享 {r['shared']} 条"
+                          + (f"，索引 {r['indexed']} 条" if r.get("indexed") else "") + "）")
                 else:
                     sk = r.get("skipped") or {}
                     why = []
@@ -4426,6 +4443,7 @@ def run_memory_cmd(args_list):
                         why.append(f"{sk['budget']} 条超出 {budget} 字预算")
                     print(f"  {r['alias']}: 共享 {r['shared']} 条"
                           + (f"，新增自有 {r['added']} 条" if r.get("added") else "")
+                          + (f"，索引 {r['indexed']} 条" if r.get("indexed") else "")
                           + (f"，{r['truncated']} 条超长未展开" if r.get("truncated") else ""))
                     if why:
                         print(f"    {COLOR_CYAN}未发布: {'；'.join(why)}{COLOR_RESET}")

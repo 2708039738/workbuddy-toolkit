@@ -321,6 +321,134 @@ class TestLock(unittest.TestCase):
         self.assertTrue(all(r["ok"] for r in results))
 
 
+class TestShardIndex(unittest.TestCase):
+    """索引 + 分片：窗口装不下的条目原文落分片，窗口里只留一行索引。"""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.a = {"alias": "alpha", "uid": "uid-a"}
+        self.b = {"alias": "beta", "uid": "uid-b"}
+
+    def _write(self, acc, text):
+        d = ms.memory_dir(self.root, acc["uid"])
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, ms.MEMORY_FILE)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return path
+
+    def _read(self, path):
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    def test_29_compact_is_idempotent(self):
+        """T29: compact 幂等，重复执行不重写、不重复生成分片"""
+        long_rule = "- 必须遵守的超长协作准则：" + "细" * 200
+        self._write(self.a, "# 记忆\n- 称呼 ser\n")
+        self._write(self.b, "# 记忆\n" + long_rule + "\n- 偏好简洁回答\n")
+        ms.collect([self.a, self.b], root=self.root)
+
+        first = ms.compact(root=self.root)
+        self.assertTrue(first["ok"])
+        self.assertGreaterEqual(first["shards"], 2, "超长条目与偏好类条目都要建分片")
+        self.assertEqual(first["shards"], first["indexed"])
+        files = sorted(os.listdir(ms.shard_dir(self.root)))
+        self.assertEqual(len(files), first["shards"])
+
+        second = ms.compact(root=self.root)
+        self.assertEqual(second["written"], 0, "内容没变不该重写分片")
+        self.assertEqual(second["shards"], first["shards"])
+        self.assertEqual(sorted(os.listdir(ms.shard_dir(self.root))), files,
+                         "重复执行不能多出分片")
+
+        lib = ms.load_library(self.root)
+        for entry in ms.active_entries(lib):
+            if entry.get("shard"):
+                self.assertTrue(entry.get("index_line").startswith("- [P"))
+
+        ms.collect([self.a, self.b], root=self.root)
+        kept = [e for e in ms.active_entries(ms.load_library(self.root)) if e.get("shard")]
+        self.assertEqual(len(kept), first["shards"], "重新汇总不能把已建索引抹掉")
+
+    def test_30_shard_keeps_original_out_of_window(self):
+        """T30: 分片内容 = 条目原文，且原文不会被注入 MEMORY.md"""
+        long_rule = "- 必须遵守的超长协作准则：" + "密" * 900 + "尾部唯一标记ZZ"
+        self._write(self.a, "# 记忆\n- 称呼 ser\n")
+        self._write(self.b, "# 记忆\n" + long_rule + "\n")
+        ms.collect([self.a, self.b], root=self.root)
+        ms.compact(root=self.root)
+
+        lib = ms.load_library(self.root)
+        entry = [e for e in ms.active_entries(lib) if e["text"] == long_rule][0]
+        self.assertTrue(entry["shard"].startswith("shards/"))
+        shard_path = os.path.join(ms.hub_dir(self.root), entry["shard"])
+        shard = self._read(shard_path)
+        head, body = shard.split("\n\n", 1)
+        self.assertIn("来源", head)
+        self.assertIn("首次收录", head)
+        self.assertEqual(body.strip(), long_rule, "分片里必须是原文，一字不改")
+
+        res = ms.apply_account(self.a, root=self.root)
+        text = self._read(os.path.join(ms.memory_dir(self.root, "uid-a"), ms.MEMORY_FILE))
+        self.assertNotIn(long_rule, text, "超预算的原文不能进 4000 字窗口")
+        self.assertNotIn("尾部唯一标记ZZ", text)
+        self.assertIn(ms.INDEX_MARKER, text, "窗口里只留索引行")
+        self.assertGreaterEqual(res["indexed"], 1)
+
+    def test_31_index_fits_budget_without_touching_origin(self):
+        """T31: 索引行落在 4000 预算内、原文一字不改；超预算时一条都不加"""
+        long_rule = "- 必须遵守的超长协作准则：" + "密" * 900
+        self._write(self.a, "# 记忆\n- 称呼 ser\n")
+        self._write(self.b, "# 记忆\n" + long_rule + "\n")
+        ms.collect([self.a, self.b], root=self.root)
+        ms.compact(root=self.root)
+
+        res = ms.apply_account(self.a, root=self.root)
+        text = self._read(os.path.join(ms.memory_dir(self.root, "uid-a"), ms.MEMORY_FILE))
+        self.assertTrue(text.startswith("# 记忆\n- 称呼 ser"), "原文必须原样留在开头")
+        self.assertEqual(res["indexed"], 1)
+        self.assertIn(ms.INDEX_MARKER, text)
+        self.assertLessEqual(len(text.strip()), ms.INJECT_LIMIT)
+        line = [l for l in text.splitlines() if l.startswith("- [P")][0]
+        self.assertLessEqual(len(line), ms.MAX_INDEX_LINE_CHARS)
+        self.assertIn("shards/", line)
+
+        # 原文几乎占满窗口：索引让位，一条也不加，原文仍一字不改
+        tight = "# 记忆\n" + "\n".join("- 自有条目 {:04d} {}".format(i, "内" * 60)
+                                     for i in range(54))
+        tight_path = self._write({"alias": "gamma", "uid": "uid-c"}, tight)
+        tight_res = ms.apply_account({"alias": "gamma", "uid": "uid-c"}, root=self.root)
+        tight_text = self._read(tight_path)
+        self.assertEqual(tight_res["indexed"], 0, "没有余量就不能再加索引")
+        self.assertNotIn(ms.INDEX_MARKER, tight_text)
+        self.assertEqual(tight_text.strip(), tight.strip(), "原文一个字都不能变")
+        self.assertLessEqual(len(tight_text.strip()), ms.INJECT_LIMIT)
+
+    def test_32_apply_without_shards_keeps_old_behavior(self):
+        """T32: 库里没有分片时，apply 走原来的渲染路径（回归保护）"""
+        self._write(self.a, "# 记忆\n- 称呼 ser\n")
+        self._write(self.b, "# 记忆\n- 提交前跑全量测试\n")
+        ms.collect([self.a, self.b], root=self.root)
+        lib = ms.load_library(self.root)
+        self.assertFalse([e for e in ms.active_entries(lib) if e.get("shard")])
+        self.assertFalse(os.path.isdir(ms.shard_dir(self.root)))
+
+        res = ms.apply_account(self.a, root=self.root)
+        text = self._read(os.path.join(ms.memory_dir(self.root, "uid-a"), ms.MEMORY_FILE))
+        self.assertGreaterEqual(res["shared"], 1)
+        self.assertEqual(res["indexed"], 0)
+        self.assertNotIn(ms.INDEX_MARKER, text)
+
+        shared = [e for e in ms.active_entries(lib) if "跑全量测试" in e["text"]]
+        self.assertEqual(text, ms.render("# 记忆\n- 称呼 ser", shared)[0],
+                         "无分片时的输出必须与旧渲染结果一致")
+
+        again = ms.apply_account(self.a, root=self.root)
+        self.assertEqual(again["action"], "unchanged")
+        self.assertEqual(again["indexed"], 0)
+
+
 class TestMemoryHubCli(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp()

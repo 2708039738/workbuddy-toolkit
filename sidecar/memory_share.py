@@ -52,6 +52,15 @@ PUBLISH_BUDGET = 800
 PUBLISH_MAX_LEVEL = 2
 MAX_PUBLISH_ENTRIES = 20
 
+# 索引 + 分片：4000 字窗口装不下所有共享规则，超长或只属于"偏好/事实"的条目
+# 原文落到 shards/<id>.md，窗口里只留一行索引（摘要 + 指向分片）。
+SHARD_MIN_CHARS = 120
+SHARD_DIRNAME = "shards"
+INDEX_MARKER = "索引："
+INDEX_SUMMARY_CHARS = 40
+MAX_INDEX_LINES = 8
+MAX_INDEX_LINE_CHARS = 80
+
 BEGIN_MARK = "<!-- shared-memory:begin -->"
 END_MARK = "<!-- shared-memory:end -->"
 SHARED_HEADER = "## 共享记忆（来自其他账号）"
@@ -71,6 +80,10 @@ def hub_dir(root=None):
 
 def library_path(root=None):
     return os.path.join(hub_dir(root), "library.json")
+
+
+def shard_dir(root=None):
+    return os.path.join(hub_dir(root), SHARD_DIRNAME)
 
 
 def snapshot_path(root, uid):
@@ -533,30 +546,62 @@ def absorb(baseline_text, current_text):
     return "\n".join(lines).rstrip() + "\n", added, upgraded
 
 
-def render(origin_text, shared_entries, limit=INJECT_LIMIT):
-    """基线原文 + 共享段落。返回 (全文, 实际写入条数, 被截断条数)。
+def summarize(text, limit=INDEX_SUMMARY_CHARS):
+    """摘要：去掉列表符/标题符后取正文前 N 字，超长加省略号。"""
+    s = re.sub(r"\s+", " ", str(text or "").strip())
+    s = re.sub(r"^[-*+>]+\s*", "", s)
+    s = re.sub(r"^\d+[.)]\s*", "", s)
+    s = re.sub(r"^#+\s*", "", s).strip()
+    if len(s) > limit:
+        s = s[:limit].rstrip() + "…"
+    return s
+
+
+def clip_index_line(line, limit=MAX_INDEX_LINE_CHARS):
+    line = str(line or "").strip()
+    if len(line) <= limit:
+        return line
+    return line[:max(1, limit - 1)].rstrip() + "…"
+
+
+def build_index_line(entry, rel):
+    """`- [P{n}] {摘要} → {shard}`，整行不超过 MAX_INDEX_LINE_CHARS。"""
+    head = "- [P{}] ".format(publish_level(entry.get("text", "")))
+    tail = " → " + rel
+    room = MAX_INDEX_LINE_CHARS - len(head) - len(tail)
+    return head + summarize(entry.get("text", ""), max(8, min(INDEX_SUMMARY_CHARS, room))) + tail
+
+
+def render(origin_text, shared_entries, limit=INJECT_LIMIT, index_entries=None):
+    """基线原文 + 共享段落（+ 索引区）。返回 (全文, 写入条数, 截断条数, 索引条数)。
 
     字符预算优先给账号自己的内容：共享段落只能在剩余空间里塞，
     绝不为了塞共享而截断原文——那等于用别人的记忆挤掉自己的记忆。
+    索引区排在正式条目之后、结尾提示之前，同样只吃剩余预算：
+    连原文都放不下的账号，索引也不会被硬塞进去。
     """
     origin = (origin_text or "").rstrip()
-    if not shared_entries:
-        return origin + "\n", 0, 0
+    index_entries = list(index_entries or [])
+    if not shared_entries and not index_entries:
+        return origin + "\n", 0, 0, 0
 
     header = [BEGIN_MARK, SHARED_HEADER, ""]
     used = len(origin) + sum(len(x) + 1 for x in header) + len(END_MARK) + 2
     body = []
-    skipped = 0
+    overflow = 0
     for entry in shared_entries:
         line = "- " + entry["text"].strip()
         if used + len(line) + 1 > limit:
-            skipped = 1
+            overflow = len(shared_entries) - len(body)
             break
         body.append(line)
         used += len(line) + 1
+    written = len(body)
 
-    if skipped:
-        remaining = len(shared_entries) - len(body)
+    # 结尾提示：先按正式条目占用的额度算，索引只能在它之后剩下的地方落
+    footer = None
+    if overflow:
+        remaining = overflow
         footer = "- （另有 {} 条共享记忆未展开，超出单次注入上限）".format(remaining)
         # 结尾提示也要算进预算：不为了写这句话而突破 4000 字上限
         while body and used + len(footer) + 1 > limit:
@@ -565,12 +610,32 @@ def render(origin_text, shared_entries, limit=INJECT_LIMIT):
             remaining += 1
             footer = "- （另有 {} 条共享记忆未展开，超出单次注入上限）".format(remaining)
         if used + len(footer) + 1 <= limit:
-            body.append(footer)
+            used += len(footer) + 1
+        else:
+            footer = None
+
+    index_lines = []
+    if index_entries and used + len(INDEX_MARKER) + 1 <= limit:
+        room = used + len(INDEX_MARKER) + 1
+        for entry in index_entries[:MAX_INDEX_LINES]:
+            line = clip_index_line(entry.get("index_line"))
+            if not line:
+                continue
+            if room + len(line) + 1 > limit:
+                break
+            index_lines.append(line)
+            room += len(line) + 1
+        if index_lines:
+            used = room
+
+    body = body + ([INDEX_MARKER] + index_lines if index_lines else [])
+    if footer:
+        body.append(footer)
 
     if not body:
-        return origin + "\n", 0, len(shared_entries)
+        return origin + "\n", 0, len(shared_entries), 0
     text = origin + "\n\n" + "\n".join(header + body + ["", END_MARK]) + "\n"
-    return text, len(body), max(0, len(shared_entries) - len(body))
+    return text, written, max(0, len(shared_entries) - written), len(index_lines)
 
 
 # ----------------------------------------------------------------------------
@@ -1003,6 +1068,10 @@ def _collect_locked(accounts, root):
             "conflicts": [],
             "first_seen": prev.get("first_seen") or now_iso(),
             "last_seen": now_iso(),
+            # id 由归一化文本决定，同一个 id 就是同一条记忆：compact 建好的
+            # 分片与索引行原样带过来，否则每次 collect 都会把索引抹掉
+            "shard": prev.get("shard"),
+            "index_line": prev.get("index_line"),
         })
 
     conflict_count = _mark_conflicts(entries)
@@ -1056,7 +1125,8 @@ def _apply_locked(acc, root, lib, budget, max_level):
     alias = acc.get("alias") or uid
     path = memory_file(root, uid, acc.get("enterprise_id"))
     result = {"ok": False, "alias": alias, "action": "error", "shared": 0,
-              "truncated": 0, "added": 0, "upgraded": 0, "backup": None, "skipped": {}}
+              "truncated": 0, "indexed": 0, "added": 0, "upgraded": 0,
+              "backup": None, "skipped": {}}
     if not path:
         result["action"] = "no_memory_file"
         return result
@@ -1093,9 +1163,11 @@ def _apply_locked(acc, root, lib, budget, max_level):
 
     shared, skipped = publishable(candidates, budget=budget, max_level=max_level)
     result["skipped"] = skipped
-    rendered, written, truncated = render(new_baseline, shared)
+    rendered, written, truncated, indexed = render(
+        new_baseline, shared, index_entries=_index_fallback(shared, candidates))
     result["shared"] = written
     result["truncated"] = truncated
+    result["indexed"] = indexed
 
     if rendered == current:
         result["ok"] = True
@@ -1113,6 +1185,78 @@ def _apply_locked(acc, root, lib, budget, max_level):
     result["ok"] = True
     result["action"] = "created" if not has_shared_block(current) else "updated"
     return result
+
+
+def _index_fallback(shared, candidates, limit=MAX_INDEX_LINES):
+    """挑出"没进正式条目、但已有索引行"的条目，供 render 在剩余预算里补索引。
+
+    排除两类，哪怕它们有索引行：
+    - suppressed：与另一条互相否定且落败，注入索引等于把两条冲突规则都摆出来；
+    - 含本机路径/账号的条目：索引行会把 D:/ 路径、邮箱原样搬到别的账号。
+    """
+    picked = {e.get("norm") or normalize(e.get("text", "")) for e in shared or []}
+    out = []
+    for entry in candidates or []:
+        if entry.get("suppressed"):
+            continue
+        norm = entry.get("norm") or normalize(entry.get("text", ""))
+        if norm in picked or not entry.get("index_line"):
+            continue
+        if is_local_fact(entry.get("text", "")):
+            continue
+        out.append(entry)
+    out.sort(key=lambda e: (publish_level(e.get("text", "")),
+                            -float(e.get("quality") or 0)))
+    return out[:limit]
+
+
+def shard_rel(entry_id):
+    return "{}/{}.md".format(SHARD_DIRNAME, _safe(entry_id))
+
+
+def _shard_text(entry, text):
+    """分片文件：第一行写来源账号与首次收录时间（纯文本，不引 YAML），空行后是原文。"""
+    who = "、".join(entry.get("aliases") or []) or "、".join(entry.get("sources") or []) or "未知"
+    first = entry.get("first_seen")
+    if not first:
+        first = now_iso()
+        entry["first_seen"] = first
+    return "来源: {} | 首次收录: {} | 条目 id: {}\n\n{}\n".format(
+        who, first, entry.get("id") or "-", text)
+
+
+def compact(root=None, shard_min=SHARD_MIN_CHARS):
+    """给"窗口装不下"的条目建分片 + 索引行，返回 {ok, shards, indexed, skipped}。
+
+    只处理原文，不改发布口径：分片是存放处，索引行才是注入物。
+    内容没变就不重写文件，重复执行也不会多出分片——文件名只由条目 id 决定。
+    """
+    root = root or default_root()
+    with file_lock(root):
+        lib = load_library(root)
+        out = {"ok": True, "shards": 0, "indexed": 0, "skipped": 0, "written": 0}
+        changed = False
+        for entry in active_entries(lib):
+            text = str(entry.get("text") or "").strip()
+            if not text or not (len(text) > shard_min or publish_level(text) >= 3):
+                out["skipped"] += 1
+                continue
+            rel = shard_rel(entry.get("id") or _entry_id(entry.get("norm") or normalize(text)))
+            content = _shard_text(entry, text)
+            path = os.path.join(hub_dir(root), rel)
+            if read_text(path) != content:
+                atomic_write_text(path, content)
+                out["written"] += 1
+            line = build_index_line(entry, rel)
+            if entry.get("shard") != rel or entry.get("index_line") != line:
+                changed = True
+            entry["shard"] = rel
+            entry["index_line"] = line
+            out["indexed"] += 1
+        out["shards"] = out["indexed"]
+        if changed or out["written"]:
+            save_library(lib, root)
+        return out
 
 
 def apply_all(accounts, root=None, budget=PUBLISH_BUDGET, max_level=PUBLISH_MAX_LEVEL):

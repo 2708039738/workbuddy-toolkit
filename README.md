@@ -35,7 +35,7 @@ WorkBuddy Toolkit 是一套本地旁路工具（sidecar），用于解决多账�
 |---|---|
 | 添加或切换账号时要反复走登录流程 | 保存本地账号配置，使用 `wb-login` / `wb-switch` |
 | 切账号后历史会话、工作区像“消失”了一样 | 复用 WorkBuddy 的共享会话语义，保持本地工作区连续 |
-| 每个账号都要重新教一遍称呼、偏好和规矩 | `wb-memory` 汇总各账号记忆，重复条目保留质量更高的一条，原文不改写 |
+| 每个账号都要重新教一遍称呼、偏好和规矩 | `wb-memory` 汇总各账号记忆，只把规则跨账号发布，重复条目保留质量更高的一条，原文不改写 |
 | WorkBuddy 自动刷新 Token 后，旧账号配置可能覆盖新状态 | 切换前先同步当前凭据，再执行替换 |
 | 副号长期不用，失效时才发现 | `wb-audit` + `wb-status` 做健康巡检 |
 | 每日签到、连续任务需要重复操作 | `wb-checkin` + 平台原生调度 |
@@ -159,13 +159,30 @@ wb-login      添加 / 刷新账号配置
 wb-list       查看已保存账号
 wb-status     查看当前账号与凭据状态
 wb-switch     切换账号
-wb-memory     跨账号记忆汇总（去重择优，可还原）
+wb-memory     跨账号记忆汇总（去重择优，只发布规则）
 wb-audit      检查账号健康度
 ```
 
 核心目标不是“能切号”，而是**切号时尽量不破坏 WorkBuddy 已经刷新的最新状态**。
 
-记忆汇总默认不开启。开启后切号时会把其他账号的记忆条目追加到当前账号 `MEMORY.md` 末尾的受管段落里：账号原文逐字保留，疑似重复的条目只保留质量更高的一条，落选版本留档，`workbuddy memory restore <账号>` 可随时还原。细节见 [功能参考](docs/feature-reference.md#跨账号记忆汇总--workbuddy-memory)。
+记忆汇总默认不开启。开启后切号时会把其他账号的**规则**追加到当前账号 `MEMORY.md` 末尾的受管段落里：账号原文逐字保留，疑似重复的条目只保留质量更高的一条，落选版本留档。
+
+```text
+workbuddy memory collect        汇总所有账号 MEMORY.md，去重择优入库
+workbuddy memory apply [账号]   渲染进指定账号（省略则全部）
+workbuddy memory rebalance      把准则/画像分流到 SOUL、USER（默认只出计划）
+workbuddy memory forget <关键词>  移出共享库并留墓碑，不再复活（默认只预览）
+workbuddy memory conflicts      查看互相否定的规则
+workbuddy memory status         库规模、可发布条数、各账号字数
+workbuddy memory restore <账号>  用基线快照还原（还原前自动备份）
+workbuddy memory on / off       开启 / 关闭切号时自动汇总渲染
+```
+
+- **`--budget N`**：共享段落自身的字数预算，默认 800。每条按“正文 + 3”计，最多 20 条，先到先得；给账号原文留出 4,000 字窗口里的位置，不是文件总长度。
+- **为什么只发布规则不发布事实**：客户端只注入 `MEMORY.md` 前 4,000 字，事实类条目又长又多，放行就会挤掉别人的原文；况且路径、客户名、内部 URL 这类本机事实跨账号带过去只会造成污染。默认只发布红线、显式指令、项目约定（P0–P2），含本机路径 / 邮箱 / URL / UUID 的条目一律不跨账号。
+- **可回滚**：目录在 `~/.workbuddy/cache/shared_memory/`，快照 `originals/<uid>/`、备份 `backups/<账号目录>/`（保留最近 10 份）。
+
+完整用法、失效场景与回滚步骤见 [跨账号记忆共享](docs/memory-sharing.md)，能力边界见 [功能参考](docs/feature-reference.md#跨账号记忆汇总--workbuddy-memory)。
 
 ### 自动化
 
@@ -328,7 +345,7 @@ Toolkit 增加运行时兼容层，同时坚持一个边界：**需要解密能�
 | `wb-list` | 查看账号配置 |
 | `wb-status` | 查看当前状态 |
 | `wb-switch` | 切换账号 |
-| `wb-memory` | 跨账号记忆汇总（去重择优，可还原） |
+| `wb-memory` | 跨账号记忆汇总（只发布规则，可还原） |
 | `wb-audit` | 凭据健康巡检 |
 | `wb-checkin` | 每日签到 / 连续任务 |
 | `wb-usage` | 使用量与积分流速 |

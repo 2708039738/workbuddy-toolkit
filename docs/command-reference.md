@@ -78,13 +78,17 @@ wb-switch
 ### 跨账号记忆汇总
 
 ```bash
-workbuddy memory collect          # 汇总所有账号 MEMORY.md，去重并保留质量更优的版本
-workbuddy memory apply [账号]     # 渲染进指定账号（省略则全部）
-workbuddy memory status           # 库规模、各账号自有/共享条数、字数
-workbuddy memory restore <账号>   # 用基线快照还原（还原前自动备份）
-workbuddy memory rebalance        # 把准则/画像分流到 SOUL、USER（默认只出计划）
+workbuddy memory collect                  # 汇总所有账号 MEMORY.md，去重并保留质量更优的版本
+workbuddy memory apply [账号]             # 渲染进指定账号（省略则全部）
+workbuddy memory apply --budget 600       # 临时收紧共享段落预算（默认 800 字）
+workbuddy memory rebalance                # 把准则/画像分流到 SOUL、USER（默认只出计划）
 workbuddy memory rebalance --apply --target 3200
-workbuddy memory on / off         # 开启 / 关闭切号时自动汇总渲染
+workbuddy memory forget "关键词"          # 移出共享库并留墓碑（默认只预览）
+workbuddy memory forget "关键词" --apply  # 确认后执行；账号原文不动
+workbuddy memory conflicts                # 查看互相否定的规则
+workbuddy memory status                   # 库规模、可发布条数、各账号自有/共享条数、字数
+workbuddy memory restore <账号>           # 用基线快照还原（还原前自动备份）
+workbuddy memory on / off                 # 开启 / 关闭切号时自动汇总渲染
 ```
 
 - **不覆盖原文**：首次接入时保存基线快照，之后只做“原文 + 追加段落”；
@@ -92,8 +96,17 @@ workbuddy memory on / off         # 开启 / 关闭切号时自动汇总渲染
 - **可还原**：`restore` 按快照写回，备份在 `cache/shared_memory/backups/`；
 - **相似判定保守**：只合并 ≥0.90 的近重复，且数字不同一律不合并（`30s` ≠ `60s`）；
 - 客户端只读前 4000 字，预算优先给账号自有内容，共享条目放不下会标注条数；
+- **只发布规则**：`publish_level` 把条目分成 P0 红线 / P1 显式指令 / P2 项目约定 / P3 习惯 / P4 事实推断，默认只发布 P0–P2；含本机路径、邮箱、URL、UUID 的条目一律不跨账号；
+- **`--budget`**：共享段落自身预算，默认 800 字，每条按“正文 + 3”计、最多 20 条，按级别与质量先到先得；它限制的是追加段落，不是文件总长；
+- **`forget`**：把匹配条目移出共享库并留墓碑，下次 `collect` 不会复活，账号原文不改动；墓碑目前没有解除命令；
+- **`conflicts`**：只差否定的两条规则只注入优先级更高的一条，另一条留档不注入，确认后可用 `forget` 永久移除；
 - `rebalance` 解决容量：客户端其实有四个常驻通道（`MEMORY.md` 4000、`SOUL.md`/`USER.md`/`IDENTITY.md` 各 10000），
   把“准则”分流到 SOUL、“画像”分流到 USER，同样一份记忆可以完整保留而不被截断。默认只打印计划，`--apply` 才写，写前备份。
+
+`collect` / `apply` / `rebalance` / `restore` / `forget` 全程持有一把跨进程锁（`cache/shared_memory/.hub.lock`，等待上限 5 秒），
+所以切号触发的自动同步与手动命令撞车时，后到的那个会提示“被另一个进程占用”，而不是互相覆盖。
+
+完整的发布分级、失效场景与回滚步骤见 [跨账号记忆共享](memory-sharing.md)。
 
 ## 健康检查与诊断
 

@@ -2328,11 +2328,396 @@ def switch_to_profile(target_name, auto_restart=True, check_health=True):
 
     print(f"{COLOR_GREEN}✔ 凭证已成功切换至: {target_name} ({target['nickname']}) (免扫码生效){COLOR_RESET}")
 
+    # 必须落在重启之前：客户端只在会话启动时读一次 MEMORY.md，
+    # 重启后再写就赶不上这一轮注入了。
+    _sync_memory_on_switch(target)
+
     if auto_restart:
         restart_workbuddy()
     else:
         print(f"{COLOR_YELLOW}提示: 请在 WorkBuddy 窗口中刷新或重启客户端以加载新账号。{COLOR_RESET}")
     return True
+
+# ==============================================================================
+# 全局记忆共享（单向发布）
+# ==============================================================================
+# 设计边界（与 workbuddy init 的会话共享是两件事）：
+#   1. 只共享本文件列出的两份：跨项目偏好（MEMORY.md）与用户画像（USER.md）。
+#      SOUL / IDENTITY / AGENT 不参与——它们回答"这个账号是谁"，同步过去等于让
+#      两个账号的人格互相覆盖，属于不可接受的副作用。
+#   2. 单向：只从母版发布到其他账号，目标账号的改动永远不回写母版。
+#   3. 覆盖前先备份目标文件；备份有保留上限，避免无限增长。
+#   4. 默认关闭，必须显式 `workbuddy memory on <账号>` 才生效。
+
+MEMORY_SHARE_FILES = ("MEMORY.md", "USER.md")
+
+# 客户端 getUserLocalMemoryContent() 只注入前 4000 字，超长部分不会进上下文
+MEMORY_INJECT_LIMIT = 4000
+
+MEMORY_SHARE_BACKUP_KEEP = 20
+
+MEMORY_ROOT_DIR = os.path.expanduser("~/.workbuddy")
+MEMORY_SHARE_FILE = os.path.expanduser("~/.workbuddy/cache/memory_share.json")
+
+
+def get_user_memory_dir(uid, enterprise_id=None):
+    """复刻客户端 WorkbuddyPathService 的目录规则：user-<uid>-<enterpriseId|personal>。
+
+    目录名必须与客户端逐字一致，差一个后缀就会同步到客户端根本不读的目录里——
+    命令报成功、记忆不生效，是最难排查的一类假成功。
+    """
+    uid = str(uid or "").strip()
+    if not uid:
+        return None
+    ent = str(enterprise_id or "").strip() or "personal"
+    return os.path.join(MEMORY_ROOT_DIR, "user-{}-{}".format(uid, ent))
+
+
+def _profile_enterprise_id(profile):
+    data = (profile or {}).get("data")
+    acc = data.get("account") if isinstance(data, dict) else None
+    if isinstance(acc, dict):
+        return acc.get("enterpriseId") or acc.get("enterprise_id")
+    return None
+
+
+def _default_memory_share_config():
+    return {
+        "enabled": False,
+        "source_uid": "",
+        "source_alias": "",
+        "source_dir": "",
+        "files": list(MEMORY_SHARE_FILES),
+        "updated_at": None,
+        "last_sync": {},
+    }
+
+
+def load_memory_share_config():
+    """读取共享配置；文件缺失/半截 JSON 一律按"关闭"处理，绝不猜一个母版出来。"""
+    cfg = _default_memory_share_config()
+    try:
+        with open(MEMORY_SHARE_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return cfg
+    if not isinstance(raw, dict):
+        return cfg
+    cfg["enabled"] = bool(raw.get("enabled"))
+    cfg["source_uid"] = str(raw.get("source_uid") or "").strip()
+    cfg["source_alias"] = str(raw.get("source_alias") or "").strip()
+    cfg["source_dir"] = str(raw.get("source_dir") or "").strip()
+    cfg["updated_at"] = raw.get("updated_at")
+    files = [n for n in (raw.get("files") or []) if n in MEMORY_SHARE_FILES]
+    cfg["files"] = files or list(MEMORY_SHARE_FILES)
+    last = raw.get("last_sync")
+    cfg["last_sync"] = last if isinstance(last, dict) else {}
+    return cfg
+
+
+def save_memory_share_config(cfg):
+    atomic_write_json(MEMORY_SHARE_FILE, cfg)
+
+
+def _memory_share_backup_dir():
+    return os.path.join(os.path.dirname(os.path.abspath(MEMORY_SHARE_FILE)), "memory_share_backups")
+
+
+def _prune_memory_share_backups(keep=MEMORY_SHARE_BACKUP_KEEP):
+    """备份目录只保留最近 N 份。rmtree 在受限环境可能被拦截，失败不影响主流程。"""
+    base = _memory_share_backup_dir()
+    try:
+        entries = sorted(e for e in os.listdir(base) if os.path.isdir(os.path.join(base, e)))
+    except OSError:
+        return
+    if len(entries) <= keep:
+        return
+    for name in entries[:-keep]:
+        try:
+            shutil.rmtree(os.path.join(base, name), ignore_errors=True)
+        except Exception:
+            pass
+
+
+def backup_memory_file(path, uid, filename):
+    """覆盖目标账号记忆前留一份带时间戳的副本，返回备份路径。"""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    safe_uid = re.sub(r"[^\w\-]", "_", str(uid or "unknown"))[:12] or "unknown"
+    target_dir = os.path.join(_memory_share_backup_dir(), stamp)
+    os.makedirs(target_dir, exist_ok=True)
+    dest = os.path.join(target_dir, "{}-{}".format(safe_uid, filename))
+    seq = 1
+    while os.path.exists(dest):
+        dest = os.path.join(target_dir, "{}-{}-{}".format(safe_uid, seq, filename))
+        seq += 1
+    shutil.copy2(path, dest)
+    _prune_memory_share_backups()
+    return dest
+
+
+def atomic_write_text(path, text):
+    """文本原子写：同目录临时文件 + fsync + os.replace。
+
+    客户端读记忆时不做容错，半截文件会被当成"记忆内容"直接注入上下文；
+    所以这里必须原子替换，不能直接 open(path, "w")。
+    """
+    import tempfile
+    target_dir = os.path.dirname(os.path.abspath(path))
+    os.makedirs(target_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp-mem-", dir=target_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        if sys.platform != "win32":
+            os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def sync_shared_memory(target_profile):
+    """把母版的 MEMORY.md / USER.md 单向发布到目标账号。
+
+    返回 dict（不打印）：ok / action / source_alias / target_alias / files / warnings
+    action 取值：disabled | no_source | no_target_uid | source_is_target |
+                source_missing | synced | noop
+    """
+    result = {
+        "ok": False,
+        "action": "disabled",
+        "source_alias": "",
+        "target_alias": "",
+        "files": [],
+        "warnings": [],
+    }
+    cfg = load_memory_share_config()
+    result["source_alias"] = cfg.get("source_alias") or ""
+    if not cfg.get("enabled"):
+        result["ok"] = True
+        return result
+
+    target = target_profile or {}
+    result["target_alias"] = str(target.get("nickname") or "")
+    dst_uid = str(target.get("uid") or "").strip()
+    if not dst_uid:
+        result["action"] = "no_target_uid"
+        result["warnings"].append("目标账号凭证里没有 UID，已跳过记忆同步")
+        return result
+
+    src_uid = str(cfg.get("source_uid") or "").strip()
+    if not src_uid:
+        result["action"] = "no_source"
+        result["warnings"].append("共享配置缺少母版 UID，请重新执行 workbuddy memory on")
+        return result
+
+    if src_uid == dst_uid:
+        result["ok"] = True
+        result["action"] = "source_is_target"
+        return result
+
+    src_dir = cfg.get("source_dir") or get_user_memory_dir(src_uid)
+    if not os.path.isdir(src_dir):
+        result["action"] = "source_missing"
+        result["warnings"].append("母版记忆目录不存在：{}".format(src_dir))
+        return result
+
+    dst_dir = get_user_memory_dir(dst_uid, _profile_enterprise_id(target))
+    if not dst_dir:
+        result["action"] = "no_target_uid"
+        result["warnings"].append("无法解析目标账号的记忆目录")
+        return result
+
+    wrote = False
+    for name in cfg.get("files") or list(MEMORY_SHARE_FILES):
+        src_path = os.path.join(src_dir, name)
+        dst_path = os.path.join(dst_dir, name)
+        item = {"file": name, "action": "missing", "backup": None, "bytes": 0, "truncated": False}
+        if not os.path.isfile(src_path):
+            result["files"].append(item)
+            continue
+        try:
+            with open(src_path, "r", encoding="utf-8") as f:
+                text = f.read()
+        except OSError as e:
+            item["action"] = "error"
+            result["warnings"].append("读取母版 {} 失败: {}".format(name, e))
+            result["files"].append(item)
+            continue
+        item["bytes"] = len(text)
+        item["truncated"] = len(text) > MEMORY_INJECT_LIMIT
+        if not text.strip():
+            item["action"] = "empty"
+            result["files"].append(item)
+            continue
+
+        existing = None
+        if os.path.islink(dst_path):
+            # 有人会手工把目标账号的 MEMORY.md 软链到别处；直接原子替换会把链接
+            # 变成普通文件，静默破坏他原本的共享方式。宁可跳过并说明。
+            item["action"] = "skipped_symlink"
+            result["warnings"].append("{} 是符号链接，已跳过（不覆盖手工链接）".format(name))
+            result["files"].append(item)
+            continue
+        if os.path.isfile(dst_path):
+            try:
+                with open(dst_path, "r", encoding="utf-8") as f:
+                    existing = f.read()
+            except OSError:
+                existing = None
+
+        if existing == text:
+            item["action"] = "same"
+            result["files"].append(item)
+            continue
+
+        try:
+            if existing is not None:
+                item["backup"] = backup_memory_file(dst_path, dst_uid, name)
+            atomic_write_text(dst_path, text)
+            item["action"] = "updated" if existing is not None else "created"
+            wrote = True
+        except OSError as e:
+            item["action"] = "error"
+            result["warnings"].append("写入 {} 失败: {}".format(name, e))
+        result["files"].append(item)
+
+    result["ok"] = not any(f["action"] == "error" for f in result["files"])
+    result["action"] = "synced" if wrote else "noop"
+
+    cfg.setdefault("last_sync", {})[dst_uid] = {
+        "at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "action": result["action"],
+        "source_uid": src_uid,
+    }
+    try:
+        save_memory_share_config(cfg)
+    except Exception:
+        pass
+    return result
+
+
+def set_memory_share_source(target_name):
+    """把指定账号设为记忆共享母版（单向发布的来源）。"""
+    result = {"ok": False, "action": "not_found", "alias": None, "uid": None,
+              "dir": None, "dir_exists": False, "files": [], "message": ""}
+    profiles = get_profiles()
+    alias, target = resolve_profile_target(profiles, target_name, allow_uid_prefix=True, quiet=True)
+    if not target:
+        result["message"] = "未找到唯一匹配 '{}' 的已保存账号".format(target_name)
+        return result
+    uid = str(target.get("uid") or "").strip()
+    result["alias"] = alias
+    result["uid"] = uid or None
+    if not uid:
+        result["action"] = "no_uid"
+        result["message"] = "该账号凭证缺少 UID，无法定位记忆目录"
+        return result
+
+    mem_dir = get_user_memory_dir(uid, _profile_enterprise_id(target))
+    result["dir"] = mem_dir
+    result["dir_exists"] = os.path.isdir(mem_dir)
+    for name in MEMORY_SHARE_FILES:
+        path = os.path.join(mem_dir, name)
+        exists = os.path.isfile(path)
+        size = os.path.getsize(path) if exists else 0
+        # 客户端按"字符数"截断，不是字节数：中文 4000 字约 12 KB，
+        # 用字节判断会把正常文件误报成超长。
+        chars = 0
+        if exists:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    chars = len(f.read())
+            except OSError:
+                chars = 0
+        result["files"].append({"file": name, "exists": exists, "bytes": size,
+                                "chars": chars, "truncated": chars > MEMORY_INJECT_LIMIT})
+
+    cfg = load_memory_share_config()
+    cfg.update({
+        "enabled": True,
+        "source_uid": uid,
+        "source_alias": alias,
+        "source_dir": mem_dir,
+        "files": list(MEMORY_SHARE_FILES),
+        "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    })
+    save_memory_share_config(cfg)
+    result["ok"] = True
+    result["action"] = "enabled"
+    result["message"] = "已启用全局记忆共享，母版: {}".format(alias)
+    return result
+
+
+def disable_memory_share():
+    cfg = load_memory_share_config()
+    was = cfg.get("enabled")
+    cfg["enabled"] = False
+    cfg["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    save_memory_share_config(cfg)
+    return {"ok": True, "action": "disabled" if was else "already_off",
+            "source_alias": cfg.get("source_alias") or ""}
+
+
+def get_memory_share_status():
+    """汇总共享配置与各账号记忆目录现状，供 memory status / 排障使用。"""
+    cfg = load_memory_share_config()
+    accounts = []
+    for alias, prof in sorted(get_profiles().items()):
+        uid = str(prof.get("uid") or "").strip()
+        mem_dir = get_user_memory_dir(uid, _profile_enterprise_id(prof)) if uid else None
+        entry = {"alias": alias, "uid": uid, "nickname": prof.get("nickname") or alias,
+                 "dir": mem_dir, "dir_exists": bool(mem_dir and os.path.isdir(mem_dir)),
+                 "files": [], "is_source": bool(uid and uid == cfg.get("source_uid"))}
+        for name in MEMORY_SHARE_FILES:
+            path = os.path.join(mem_dir, name) if mem_dir else None
+            exists = bool(path and os.path.isfile(path))
+            entry["files"].append({"file": name, "exists": exists,
+                                   "bytes": os.path.getsize(path) if exists else 0})
+        accounts.append(entry)
+    return {"config": cfg, "accounts": accounts}
+
+
+def _sync_memory_on_switch(target):
+    """切号后、重启客户端前执行一次发布。任何异常都不能阻断切号。"""
+    try:
+        res = sync_shared_memory(target)
+    except Exception as e:
+        print(f"{COLOR_YELLOW}  [记忆] 同步异常（已忽略，不影响切号）: {e}{COLOR_RESET}")
+        return
+    action = res.get("action")
+    if action in ("disabled", "source_is_target"):
+        return
+    if action == "source_missing":
+        print(f"{COLOR_YELLOW}  [记忆] 母版目录不存在，本次跳过（workbuddy memory status 查看）{COLOR_RESET}")
+        return
+    labels = {
+        "created": "已写入",
+        "updated": "已覆盖并备份",
+        "same": "未变化",
+        "missing": "母版缺少",
+        "empty": "母版为空",
+        "error": "失败",
+        "skipped_symlink": "符号链接，已跳过",
+    }
+    parts = []
+    truncated = False
+    for item in res.get("files") or []:
+        label = labels.get(item.get("action"), item.get("action"))
+        parts.append("{} {}".format(item.get("file"), label))
+        truncated = truncated or bool(item.get("truncated"))
+    if parts:
+        print("  [记忆] " + "；".join(parts))
+    if truncated:
+        print(f"{COLOR_YELLOW}  [记忆] 内容超过 {MEMORY_INJECT_LIMIT} 字，客户端只注入前 {MEMORY_INJECT_LIMIT} 字{COLOR_RESET}")
+    for warning in res.get("warnings") or []:
+        print(f"{COLOR_YELLOW}  [记忆] {warning}{COLOR_RESET}")
+
 
 def send_chat_message(token, uid, prompt="请回复：你好", model=None, timeout=15):
     """
@@ -4180,6 +4565,110 @@ def run_interactive_tool_cmd(args=None):
     code = interactive_tool.run_interactive_tool(ctx, args=args)
     sys.exit(code)
 
+MEMORY_USAGE = "用法: workbuddy memory [on <账号名> | off | status] [--json]"
+
+def _parse_memory_cli_args(args_list):
+    """解析 memory 子命令。返回 (action, target, as_json)。
+
+    `workbuddy memory <别名>` 等价于 `on <别名>`，少打一个词。
+    """
+    as_json = any(a in ("--json", "-j") for a in args_list)
+    clean = [a for a in args_list if a not in ("--json", "-j")]
+    if not clean:
+        return "status", None, as_json
+    head = clean[0].lower()
+    if head in ("on", "share", "enable", "use"):
+        return "on", (clean[1] if len(clean) > 1 else None), as_json
+    if head in ("off", "disable", "stop", "none"):
+        return "off", None, as_json
+    if head in ("status", "show", "info"):
+        return "status", None, as_json
+    return "on", clean[0], as_json
+
+def run_memory_cmd(args_list):
+    """`workbuddy memory` 子命令入口。退出码: 0 成功，1 失败，2 参数缺失。"""
+    if any(a in ("-h", "--help", "help") for a in args_list):
+        print(MEMORY_USAGE)
+        print("  on <账号名>  指定母版账号并开启单向发布（别名/昵称/UID 前缀均可）")
+        print("  off          关闭共享，已同步出去的文件不会回收")
+        print("  status       查看母版、各账号记忆目录与文件大小")
+        print("  --json       以 JSON 输出，便于脚本消费")
+        print("  同步时机: 仅 workbuddy switch 到其他账号时自动执行，不回写母版")
+        return 0
+    action, target, as_json = _parse_memory_cli_args(args_list)
+
+    if action == "on":
+        if not target:
+            print(f"{COLOR_RED}请指定母版账号，例如: workbuddy memory on acc_55211{COLOR_RESET}")
+            print(MEMORY_USAGE)
+            return 2
+        res = set_memory_share_source(target)
+        if as_json:
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+        elif not res.get("ok"):
+            print(f"{COLOR_RED}错误: {res.get('message')}{COLOR_RESET}")
+            print("提示: 用 workbuddy list 查看已保存账号")
+        else:
+            print(f"{COLOR_GREEN}✔ {res['message']}{COLOR_RESET}")
+            print(f"  母版目录: {res['dir']}")
+            if not res.get("dir_exists"):
+                print(f"{COLOR_YELLOW}  ▲ 该目录尚不存在：账号还没在客户端登录过。"
+                      f"首次同步会跳过，登录产生记忆后自动生效。{COLOR_RESET}")
+            else:
+                for item in res.get("files") or []:
+                    if item.get("exists"):
+                        note = "（超过 4000 字，客户端只注入前 4000 字）" if item.get("truncated") else ""
+                        print(f"  {item['file']}: {item['bytes']:,} 字节 / {item.get('chars', 0):,} 字{note}")
+                    else:
+                        print(f"  {item['file']}: 尚无内容")
+            print(f"  {COLOR_CYAN}同步时机: workbuddy switch 到其他账号时自动发布；不会回写母版{COLOR_RESET}")
+        return 0 if res.get("ok") else 1
+
+    if action == "off":
+        res = disable_memory_share()
+        if as_json:
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+        elif res.get("action") == "already_off":
+            print("全局记忆共享本来就是关闭状态。")
+        else:
+            print(f"{COLOR_GREEN}✔ 已关闭全局记忆共享。{COLOR_RESET}")
+            print("  已同步到其他账号的文件保持原样，不会被回收；如需还原请从备份目录取回。")
+        return 0
+
+    status = get_memory_share_status()
+    if as_json:
+        print(json.dumps(status, ensure_ascii=False, indent=2))
+        return 0
+    cfg = status["config"]
+    if cfg.get("enabled"):
+        print(f"{COLOR_GREEN}全局记忆共享: 已启用（单向发布）{COLOR_RESET}")
+        print(f"  母版: {cfg.get('source_alias') or '(未知)'}  {str(cfg.get('source_uid') or '')[:8]}...")
+        print(f"  目录: {cfg.get('source_dir') or '(未记录)'}")
+        print(f"  文件: {' / '.join(cfg.get('files') or list(MEMORY_SHARE_FILES))}")
+        print("  时机: workbuddy switch 到其他账号时自动执行")
+    else:
+        print(f"{COLOR_YELLOW}全局记忆共享: 未启用{COLOR_RESET}")
+        print("  开启: workbuddy memory on <母版账号>")
+    last = cfg.get("last_sync") or {}
+    if last:
+        recent = sorted(last.items(), key=lambda kv: str(kv[1].get("at") or ""))[-3:]
+        print("  最近同步:")
+        for uid, info in recent:
+            print(f"    {str(uid)[:8]}...  {info.get('at') or '?'}  {info.get('action') or '?'}")
+    if status["accounts"]:
+        print("  账号记忆目录:")
+        for acc in status["accounts"]:
+            mark = f"{COLOR_CYAN}[母版]{COLOR_RESET}" if acc["is_source"] else "      "
+            state = "" if acc["dir_exists"] else f"{COLOR_YELLOW}(目录不存在){COLOR_RESET}"
+            print(f"    {mark} {acc['alias']:<12} {acc['nickname'][:10]:<10} {state}")
+            if acc["dir_exists"]:
+                detail = "  ".join(
+                    "{} {}".format(f["file"], f"{f['bytes']:,}B" if f["exists"] else "—")
+                    for f in acc["files"]
+                )
+                print(f"             {detail}")
+    return 0
+
 def print_help():
     print(f"""
 {COLOR_BOLD}WorkBuddy CLI (v{VERSION}){COLOR_RESET}
@@ -4193,6 +4682,7 @@ def print_help():
   workbuddy help                  查看本帮助信息 (别名: wb-help, workbuddy-help)
   workbuddy login [别名] [--force] 独立免登扫码录入 (别名: wb-login)
   workbuddy switch [账号名]        免重新扫码切换账号 (别名: wb-switch)
+  workbuddy memory [on|off|status] 跨账号共享全局记忆 (别名: wb-memory)
   workbuddy list / status [--json] 查看账号列表与凭证状态 (别名: wb-list, wb-status)
   workbuddy audit [--daemon]      凭据健康审计与常驻巡检 (别名: wb-audit)
   workbuddy usage [选项]           积分消耗与流速统计 (别名: wb-usage)
@@ -4264,6 +4754,8 @@ def main():
         target = clean_args[0] if clean_args else None
         run_checkin(target, with_chat=with_chat)
         return
+    if "memory" in prog_name:
+        sys.exit(run_memory_cmd(args))
     if "switch" in prog_name:
         if args:
             switch_to_profile(args[0], auto_restart=True)
@@ -4334,6 +4826,8 @@ def main():
             switch_to_profile(args[1], auto_restart=True)
         else:
             interactive_menu()
+    elif cmd in ["memory", "mem", "memory-share"]:
+        sys.exit(run_memory_cmd(args[1:]))
     elif cmd in ["checkin", "check-in", "sign", "signin"]:
         with_chat = ("--no-chat" not in args)
         clean_args = [a for a in args[1:] if a != "--no-chat"]

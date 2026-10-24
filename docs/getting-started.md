@@ -98,6 +98,28 @@ wb-switch
 
 Toolkit 会在切换前同步当前登录态，降低旧账号配置覆盖新 Token 的风险。
 
+### 可选：让多个账号共用一份记忆
+
+默认不共享。确认要让所有账号使用同一份跨项目偏好和用户画像时：
+
+```bash
+workbuddy memory on <母版账号>
+```
+
+之后每次 `workbuddy switch` 到其他账号，都会把母版的 `MEMORY.md` / `USER.md` 复制过去（单向，不回写）。
+
+关闭：
+
+```bash
+workbuddy memory off
+```
+
+只想确认当前状态（母版是谁、各账号记忆文件多大）：
+
+```bash
+workbuddy memory status
+```
+
 ## 5. 自动签到与账号巡检
 
 手动运行一次签到：

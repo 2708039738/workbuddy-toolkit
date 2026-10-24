@@ -45,6 +45,10 @@ class TestWorkBuddyCore(unittest.TestCase):
         workbuddy.PROFILES_DIR = os.path.join(self.test_dir, "auth_profiles")
         workbuddy.DB_FILE = os.path.join(self.test_dir, "workbuddy.db")
         workbuddy.AUDIT_CACHE_FILE = os.path.join(self.test_dir, "cache", "audit_cache.json")
+        self.orig_memory_root = workbuddy.MEMORY_ROOT_DIR
+        self.orig_memory_share_file = workbuddy.MEMORY_SHARE_FILE
+        workbuddy.MEMORY_ROOT_DIR = os.path.join(self.test_dir, "wb_root")
+        workbuddy.MEMORY_SHARE_FILE = os.path.join(self.test_dir, "cache", "memory_share.json")
 
         os.makedirs(os.path.dirname(workbuddy.AUTH_FILE), exist_ok=True)
         os.makedirs(workbuddy.PROFILES_DIR, exist_ok=True)
@@ -76,6 +80,8 @@ class TestWorkBuddyCore(unittest.TestCase):
         workbuddy.DB_FILE = self.orig_db_file
         if self.orig_audit_cache_file:
             workbuddy.AUDIT_CACHE_FILE = self.orig_audit_cache_file
+        workbuddy.MEMORY_ROOT_DIR = self.orig_memory_root
+        workbuddy.MEMORY_SHARE_FILE = self.orig_memory_share_file
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_01_paths_and_colors(self):
@@ -1526,6 +1532,211 @@ class TestWorkBuddyCore(unittest.TestCase):
         with patch("urllib.request.urlopen", side_effect=http_err):
             with self.assertRaises(urllib.error.HTTPError):
                 workbuddy.robust_urlopen(req, timeout=5)
+
+    # ------------------------------------------------------------------
+    # 全局记忆共享（单向发布）
+    # ------------------------------------------------------------------
+    def _put_profile(self, alias, uid, nickname="Nick", enterprise_id=None):
+        path = os.path.join(workbuddy.PROFILES_DIR, "{}.info".format(alias))
+        os.makedirs(workbuddy.PROFILES_DIR, exist_ok=True)
+        acc = {"uid": uid, "nickname": nickname}
+        if enterprise_id:
+            acc["enterpriseId"] = enterprise_id
+        payload = {
+            "account": acc,
+            "auth": {"accessToken": "tok", "expiresAt": 1800000000000, "refreshExpiresAt": 1900000000000},
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        return path
+
+    def _put_memory(self, uid, name, text, enterprise_id=None):
+        d = workbuddy.get_user_memory_dir(uid, enterprise_id)
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return path
+
+    def test_t63_memory_share_on_off_lifecycle(self):
+        """T63: memory on/off 落盘配置；关闭后保留母版记录，便于重新开启"""
+        import io
+
+        self._put_profile("master", "uid-master", "Master")
+        with patch("sys.stdout", io.StringIO()):
+            res = workbuddy.set_memory_share_source("master")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["action"], "enabled")
+        self.assertEqual(res["uid"], "uid-master")
+
+        cfg = workbuddy.load_memory_share_config()
+        self.assertTrue(cfg["enabled"])
+        self.assertEqual(cfg["source_uid"], "uid-master")
+        self.assertEqual(cfg["files"], ["MEMORY.md", "USER.md"])
+        self.assertEqual(cfg["source_dir"], workbuddy.get_user_memory_dir("uid-master"))
+
+        with patch("sys.stdout", io.StringIO()):
+            off = workbuddy.disable_memory_share()
+        self.assertEqual(off["action"], "disabled")
+        cfg = workbuddy.load_memory_share_config()
+        self.assertFalse(cfg["enabled"])
+        self.assertEqual(cfg["source_uid"], "uid-master", "关闭不应抹掉母版记录")
+
+        with patch("sys.stdout", io.StringIO()):
+            again = workbuddy.disable_memory_share()
+        self.assertEqual(again["action"], "already_off")
+
+    def test_t64_sync_publishes_files_to_target(self):
+        """T64: 单向发布把母版两份文件写到目标账号目录，第二次同步为 noop"""
+        self._put_profile("master", "uid-master", "Master")
+        self._put_profile("slave", "uid-slave", "Slave")
+        self._put_memory("uid-master", "MEMORY.md", "# 记忆\n- 称呼 ser\n")
+        self._put_memory("uid-master", "USER.md", "# 用户\n- 中文\n")
+        workbuddy.set_memory_share_source("master")
+
+        target = workbuddy.get_profiles()["slave"]
+        res = workbuddy.sync_shared_memory(target)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["action"], "synced")
+        self.assertEqual({f["file"]: f["action"] for f in res["files"]},
+                         {"MEMORY.md": "created", "USER.md": "created"})
+
+        dst_dir = workbuddy.get_user_memory_dir("uid-slave")
+        with open(os.path.join(dst_dir, "MEMORY.md"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "# 记忆\n- 称呼 ser\n")
+        with open(os.path.join(dst_dir, "USER.md"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "# 用户\n- 中文\n")
+
+        # 幂等：内容相同不重写，也不产生新备份
+        before = os.path.getmtime(os.path.join(dst_dir, "MEMORY.md"))
+        again = workbuddy.sync_shared_memory(target)
+        self.assertEqual(again["action"], "noop")
+        self.assertEqual({f["file"]: f["action"] for f in again["files"]},
+                         {"MEMORY.md": "same", "USER.md": "same"})
+        self.assertEqual(before, os.path.getmtime(os.path.join(dst_dir, "MEMORY.md")))
+
+    def test_t65_sync_backs_up_before_overwrite(self):
+        """T65: 目标账号已有不同内容时先备份再覆盖，备份里是旧内容"""
+        self._put_profile("master", "uid-master", "Master")
+        self._put_profile("slave", "uid-slave", "Slave")
+        self._put_memory("uid-master", "MEMORY.md", "母版内容")
+        self._put_memory("uid-slave", "MEMORY.md", "目标账号自己的内容")
+        workbuddy.set_memory_share_source("master")
+
+        res = workbuddy.sync_shared_memory(workbuddy.get_profiles()["slave"])
+        self.assertTrue(res["ok"])
+        items = {f["file"]: f for f in res["files"]}
+        self.assertEqual(items["MEMORY.md"]["action"], "updated")
+        backup = items["MEMORY.md"]["backup"]
+        self.assertTrue(backup and os.path.isfile(backup))
+        self.assertTrue(backup.startswith(workbuddy._memory_share_backup_dir()))
+        with open(backup, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "目标账号自己的内容")
+        with open(os.path.join(workbuddy.get_user_memory_dir("uid-slave"), "MEMORY.md"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "母版内容")
+
+    def test_t66_sync_guards_never_write_blindly(self):
+        """T66: 关闭 / 母版即目标 / 母版目录缺失 / 母版为空，四种情况都不写目标"""
+        import io
+
+        self._put_profile("master", "uid-master", "Master")
+        self._put_profile("slave", "uid-slave", "Slave")
+        slave = workbuddy.get_profiles()["slave"]
+        dst = os.path.join(workbuddy.get_user_memory_dir("uid-slave"), "MEMORY.md")
+
+        # 1. 默认关闭
+        with patch("sys.stdout", io.StringIO()):
+            off = workbuddy.sync_shared_memory(slave)
+        self.assertEqual(off["action"], "disabled")
+        self.assertFalse(os.path.exists(dst))
+
+        # 2. 母版目录缺失（账号从未在客户端登录）
+        workbuddy.set_memory_share_source("master")
+        missing = workbuddy.sync_shared_memory(slave)
+        self.assertFalse(missing["ok"])
+        self.assertEqual(missing["action"], "source_missing")
+        self.assertFalse(os.path.exists(dst))
+
+        # 3. 母版记忆为空文件：不得用空内容覆盖目标
+        self._put_memory("uid-master", "MEMORY.md", "   \n")
+        empty = workbuddy.sync_shared_memory(slave)
+        self.assertEqual({f["file"]: f["action"] for f in empty["files"]}["MEMORY.md"], "empty")
+        self.assertFalse(os.path.exists(dst))
+
+        # 4. 目标就是母版本身：直接返回，不做任何写入
+        self._put_memory("uid-master", "MEMORY.md", "母版")
+        self_sync = workbuddy.sync_shared_memory(workbuddy.get_profiles()["master"])
+        self.assertEqual(self_sync["action"], "source_is_target")
+        self.assertEqual(self_sync["files"], [])
+
+    def test_t67_memory_dir_honors_enterprise_id_and_reports_truncation(self):
+        """T67: 企业账号目录带 enterpriseId 后缀；超过 4000 字标记会被客户端截断"""
+        self._put_profile("corp", "uid-corp", "Corp", enterprise_id="ent-9")
+        long_text = "x" * (workbuddy.MEMORY_INJECT_LIMIT + 10)
+        # 2000 个汉字约 6 KB，但只有 2000 字：按字节判断会误报超长
+        mid_text = "记" * 2000
+        self._put_memory("uid-corp", "MEMORY.md", long_text, enterprise_id="ent-9")
+        self._put_memory("uid-corp", "USER.md", mid_text, enterprise_id="ent-9")
+
+        d = workbuddy.get_user_memory_dir("uid-corp", "ent-9")
+        self.assertTrue(d.endswith("user-uid-corp-ent-9"))
+
+        res = workbuddy.set_memory_share_source("corp")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["dir"], d)
+        self.assertTrue(res["dir_exists"])
+        item = {f["file"]: f for f in res["files"]}["MEMORY.md"]
+        self.assertTrue(item["truncated"])
+        self.assertEqual(item["bytes"], len(long_text))
+        user_item = {f["file"]: f for f in res["files"]}["USER.md"]
+        self.assertFalse(user_item["truncated"], "截断判断必须按字符数，不能按字节数")
+
+        # 个人账号不能复用企业目录
+        self.assertNotEqual(workbuddy.get_user_memory_dir("uid-corp"), d)
+        self.assertTrue(workbuddy.get_user_memory_dir("uid-corp").endswith("user-uid-corp-personal"))
+
+    def test_t68_switch_publishes_memory_before_restart(self):
+        """T68: 切号流程自动发布记忆（重启之前），且母版自身不被改写"""
+        import io
+
+        self._put_profile("master", "uid-master", "Master")
+        self._put_profile("slave", "uid-slave", "Slave")
+        self._put_memory("uid-master", "MEMORY.md", "母版记忆")
+        workbuddy.set_memory_share_source("master")
+
+        with open(workbuddy.AUTH_FILE, "w", encoding="utf-8") as f:
+            json.dump({"account": {"uid": "uid-master", "nickname": "Master"},
+                       "auth": {"accessToken": "tok", "expiresAt": 1800000000000}}, f)
+
+        calls = []
+        with patch("sys.stdout", io.StringIO()):
+            with patch.object(workbuddy, "restart_workbuddy", lambda: calls.append("restart")):
+                with patch.object(workbuddy, "check_profile_health", lambda *a, **k: {"status": "HEALTHY"}):
+                    ok = workbuddy.switch_to_profile("slave", auto_restart=True)
+        self.assertTrue(ok)
+        self.assertEqual(calls, ["restart"])
+
+        dst = os.path.join(workbuddy.get_user_memory_dir("uid-slave"), "MEMORY.md")
+        self.assertTrue(os.path.isfile(dst))
+        with open(dst, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "母版记忆")
+        # 母版未受污染
+        with open(os.path.join(workbuddy.get_user_memory_dir("uid-master"), "MEMORY.md"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "母版记忆")
+
+    def test_t69_memory_cli_usage_and_exit_codes(self):
+        """T69: memory 子命令的参数校验与退出码（2=缺参数，1=账号不存在）"""
+        import io
+
+        self._put_profile("master", "uid-master", "Master")
+        with patch("sys.stdout", io.StringIO()):
+            self.assertEqual(workbuddy.run_memory_cmd(["--help"]), 0)
+            self.assertEqual(workbuddy.run_memory_cmd(["on"]), 2)
+            self.assertEqual(workbuddy.run_memory_cmd(["on", "不存在"]), 1)
+            self.assertEqual(workbuddy.run_memory_cmd(["on", "master"]), 0)
+            self.assertEqual(workbuddy.run_memory_cmd([]), 0)
+            self.assertEqual(workbuddy.run_memory_cmd(["off"]), 0)
+        self.assertFalse(workbuddy.load_memory_share_config()["enabled"])
 
 if __name__ == "__main__":
     unittest.main()

@@ -60,6 +60,7 @@ TOOLKIT_OWNED_FILES = [
     "router_token",
     "log_guard.json",
     os.path.join("cache", "audit_cache.json"),
+    os.path.join("cache", "removed_profiles.json"),
     os.path.join("cache", "heal.lock"),
     os.path.join("logs", "failover_router.log"),
     os.path.join("logs", "checkin.log"),

@@ -69,6 +69,17 @@ class TestWorkBuddyCore(unittest.TestCase):
         """)
         self.con.commit()
 
+        # 正向隔离断言：所有被重定向的路径都必须落在本次临时目录内，
+        # 避免测试配置漂移后碰到真实 ~/.workbuddy。
+        root = os.path.abspath(self.test_dir) + os.sep
+        for label, path in (
+            ("PROFILES_DIR", workbuddy.PROFILES_DIR),
+            ("AUTH_FILE", workbuddy.AUTH_FILE),
+            ("AUDIT_CACHE_FILE", workbuddy.AUDIT_CACHE_FILE),
+        ):
+            self.assertTrue(os.path.abspath(path).startswith(root),
+                            "{} 未隔离到临时目录: {}".format(label, path))
+
     def tearDown(self):
         self.con.close()
         workbuddy.AUTH_FILE = self.orig_auth_file
@@ -2326,6 +2337,128 @@ class TestWorkBuddyCore(unittest.TestCase):
         self.assertTrue(res.get("credential_restored"))
         self.assertTrue(os.path.exists(path), "凭证应回滚到原路径")
         self.assertTrue(os.path.exists(marker), "junction 目标内容被复制或删除")
+
+    def test_t84_removed_active_account_is_not_recreated_by_checkin(self):
+        """T84: 删掉活跃账号后，wb-checkin 不得从 AUTH_FILE 自动把它收回来"""
+        import io
+
+        path = self._write_profile("active", "uid-act", "Act")
+        with open(workbuddy.AUTH_FILE, "w", encoding="utf-8") as f:
+            json.dump({"account": {"uid": "uid-act", "nickname": "Act"},
+                       "auth": {"accessToken": "tok"}}, f)
+        with patch("sys.stdout", io.StringIO()):
+            res = workbuddy.remove_profile("active", yes=True, force=True)
+        self.assertTrue(res["was_active"])
+        self.assertTrue(workbuddy.is_uid_removed("uid-act"))
+        self.assertFalse(os.path.exists(path))
+
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            workbuddy.run_checkin(with_chat=False)
+        self.assertFalse(os.path.exists(path), "checkin 把已删账号重新保存了")
+        self.assertNotIn("active", workbuddy.get_profiles())
+        self.assertIn("跳过自动入库", buf.getvalue())
+
+        # 显式重新保存（等价于用户主动恢复）应解除墓碑
+        with patch("sys.stdout", io.StringIO()):
+            workbuddy.save_current("saved")
+        self.assertFalse(workbuddy.is_uid_removed("uid-act"))
+        self.assertIn("saved", workbuddy.get_profiles())
+
+    def test_t85_confirmation_snapshot_does_not_delete_new_files(self):
+        """T85: 确认期间新增的档案不在快照里，必须保留，不能被一起归档"""
+        import io
+
+        self._write_profile("snap", "uid-snap", "Snap")
+        old_dir, _cloud = self._write_account_memory("uid-snap")
+        late_dir = os.path.join(os.path.dirname(workbuddy.PROFILES_DIR),
+                                "user-uid-snap-late")
+
+        def fake_input(_prompt):
+            # 用户看到确认提示后，另一个进程写入了一份新档案
+            if not os.path.isdir(late_dir):
+                os.makedirs(late_dir)
+                with open(os.path.join(late_dir, "MEMORY.md"), "w", encoding="utf-8") as f:
+                    f.write("late")
+            return "y"
+
+        with patch.object(workbuddy.sys.stdin, "isatty", return_value=True):
+            with patch("builtins.input", side_effect=fake_input):
+                with patch("sys.stdout", io.StringIO()):
+                    res = workbuddy.remove_profile("snap", purge_memory=True)
+
+        self.assertTrue(res["ok"], res["message"])
+        self.assertFalse(os.path.isdir(old_dir), "快照里的旧档案应被归档")
+        self.assertTrue(os.path.isdir(late_dir), "确认后新增的档案被误删")
+        self.assertTrue(os.path.isfile(os.path.join(late_dir, "MEMORY.md")))
+        self.assertEqual(len(res.get("memory_new") or []), 1)
+
+    def test_t86_invalid_backup_restore_refused_and_purge_trash(self):
+        """T86: 损坏备份不能被当成"恢复成功"；--purge-trash 可单条清理"""
+        import io
+
+        path = os.path.join(workbuddy.PROFILES_DIR, "broken.info")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{not valid json")
+        with patch("sys.stdout", io.StringIO()):
+            removed = workbuddy.remove_profile("broken", yes=True, force=True)
+        self.assertTrue(removed["ok"])
+        name = os.path.basename(removed["trash_path"])
+
+        with patch("sys.stdout", io.StringIO()):
+            restored = workbuddy.restore_from_trash(name, yes=True)
+        self.assertFalse(restored["ok"])
+        self.assertEqual(restored["action"], "refused_invalid")
+        self.assertTrue(os.path.exists(removed["trash_path"]), "拒绝恢复不应删掉备份")
+
+        with patch("sys.stdout", io.StringIO()):
+            self.assertEqual(workbuddy.run_remove_cmd(["--purge-trash", name, "--yes"]), 0)
+        self.assertFalse(os.path.exists(removed["trash_path"]))
+
+        with patch("sys.stdout", io.StringIO()):
+            self.assertEqual(workbuddy.run_remove_cmd(["--purge-trash", "../" + name]), 2)
+
+    def test_t87_purge_trash_removes_paired_memory_bundle(self):
+        """T87: --purge-trash 给凭证名时，同 stem 的记忆归档一起清掉"""
+        import io
+
+        self._write_profile("pair", "uid-pair", "Pair")
+        profile_dir, cloud_path = self._write_account_memory("uid-pair")
+        with patch("sys.stdout", io.StringIO()):
+            removed = workbuddy.remove_profile("pair", yes=True, purge_memory=True)
+        name = os.path.basename(removed["trash_path"])
+        bundle = removed["memory_bundle"]
+        self.assertTrue(os.path.isdir(bundle))
+
+        with patch("sys.stdout", io.StringIO()):
+            self.assertEqual(workbuddy.run_remove_cmd(["--purge-trash", name, "--yes"]), 0)
+        self.assertFalse(os.path.exists(removed["trash_path"]))
+        self.assertFalse(os.path.isdir(bundle))
+        self.assertFalse(os.path.exists(profile_dir))
+        self.assertFalse(os.path.exists(cloud_path))
+
+    def test_t88_cancel_writes_nothing(self):
+        """T88: 回答 n 时零字节改动：凭证、档案、回收站、墓碑、审计缓存都不动"""
+        import io
+
+        path = self._write_profile("cancel", "uid-cancel", "Cancel")
+        profile_dir, cloud_path = self._write_account_memory("uid-cancel")
+        workbuddy.save_audit_cache({"uid-cancel": {"status": "HEALTHY"}})
+        before_cache = workbuddy.get_audit_cache()
+
+        with patch.object(workbuddy.sys.stdin, "isatty", return_value=True):
+            with patch("builtins.input", return_value="n"):
+                with patch("sys.stdout", io.StringIO()):
+                    res = workbuddy.remove_profile("cancel", purge_memory=True)
+
+        self.assertEqual(res["action"], "cancelled")
+        self.assertTrue(os.path.exists(path))
+        self.assertTrue(os.path.isdir(profile_dir))
+        self.assertTrue(os.path.exists(cloud_path))
+        self.assertEqual(workbuddy.get_audit_cache(), before_cache)
+        self.assertFalse(workbuddy.is_uid_removed("uid-cancel"))
+        trash = workbuddy.get_profiles_trash_dir()
+        self.assertFalse(os.path.isdir(trash) and os.listdir(trash))
 
 if __name__ == "__main__":
     unittest.main()

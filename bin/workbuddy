@@ -2532,7 +2532,7 @@ def _collect_share_entries(source_dir, target_dir, source_uid, target_uid, scope
     for suffix in ("_memory.md", "_memery.md"):
         src_path = os.path.join(flat_dir, "{}{}".format(source_uid, suffix))
         if os.path.isfile(src_path):
-            add_file("memory/{}{}".format(target_uid, suffix), src_path,
+            add_file("memory/{}{}（设备缓存）".format(target_uid, suffix), src_path,
                      os.path.join(flat_dir, "{}{}".format(target_uid, suffix)))
 
     src_mem_dir = os.path.join(source_dir, "memory")
@@ -2545,7 +2545,7 @@ def _collect_share_entries(source_dir, target_dir, source_uid, target_uid, scope
         if os.path.islink(src_path) or not os.path.isfile(src_path):
             continue
         new_name = name.replace(source_uid, target_uid) if source_uid in name else name
-        add_file("memory/{}".format(new_name), src_path,
+        add_file("memory/{}（账号缓存）".format(new_name), src_path,
                  os.path.join(target_dir, "memory", new_name))
     return entries
 

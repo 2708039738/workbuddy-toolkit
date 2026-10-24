@@ -75,6 +75,8 @@ Toolkit 初始化本地共享机制，复用 WorkBuddy 已有的共享会话语�
 
 目录按客户端的 `user-<uid>-<enterpriseId|personal>` 规则解析，与 `~/.workbuddy` 下的实际目录逐字对齐；云端档案的文件名内嵌 uid，发布时会改名成目标 uid，否则目标账号根本读不到——这类“命令成功但记忆不生效”的假成功，比报错更难排查。
 
+> **关于 `AGENT.md`**：它属于账号档案，会随 `all` 范围一起搬运，但**当前不被客户端身份注入链读取**——客户端只读 `IDENTITY.md` / `USER.md` / `SOUL.md` / `MEMORY.md`，CLI 的指令文件基名是 `CODEBUDDY` 而非 `AGENT`。搬运它是为了让整份档案保持一致；若将来客户端或 agent 开始读取它，发布即自动生效，不需要改代码。
+
 ## 日常自动化
 
 ### 签到与连续任务 — `wb-checkin`

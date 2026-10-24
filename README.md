@@ -35,7 +35,7 @@ WorkBuddy Toolkit 是一套本地旁路工具（sidecar），用于解决多账�
 |---|---|
 | 添加或切换账号时要反复走登录流程 | 保存本地账号配置，使用 `wb-login` / `wb-switch` |
 | 切账号后历史会话、工作区像“消失”了一样 | 复用 WorkBuddy 的共享会话语义，保持本地工作区连续 |
-| 每个账号都要重新教一遍称呼、偏好和画像 | `wb-memory` 把母版账号的 `MEMORY.md` / `USER.md` 单向发布过去 |
+| 每个账号都要重新教一遍称呼、偏好和画像 | `wb-memory` 把母版账号的整份档案单向发布过去（含 `AGENT.md`、`SOUL.md`、`IDENTITY.md`） |
 | WorkBuddy 自动刷新 Token 后，旧账号配置可能覆盖新状态 | 切换前先同步当前凭据，再执行替换 |
 | 副号长期不用，失效时才发现 | `wb-audit` + `wb-status` 做健康巡检 |
 | 每日签到、连续任务需要重复操作 | `wb-checkin` + 平台原生调度 |
@@ -165,7 +165,7 @@ wb-audit      检查账号健康度
 
 核心目标不是“能切号”，而是**切号时尽量不破坏 WorkBuddy 已经刷新的最新状态**。
 
-记忆共享默认关闭，且只共享 `MEMORY.md` 与 `USER.md`：母版账号发布，其他账号接收，反向不写回。`SOUL.md` / `IDENTITY.md` / `AGENT.md` 不参与，避免两个账号的人格互相覆盖。细节见 [功能参考](docs/feature-reference.md#全局记忆共享--workbuddy-memory)。
+记忆共享默认关闭。开启后默认按 `all` 范围发布**整份账号档案**：`MEMORY.md`、`USER.md`、`AGENT.md`、`SOUL.md`、`IDENTITY.md`、`BOOTSTRAP.md`、`workspace-state.json` 以及云端档案缓存，母版发布、其他账号接收，反向不写回。只想共享偏好、保留各自人格时用 `--scope prefs`（仅 `MEMORY.md` / `USER.md`）。细节见 [功能参考](docs/feature-reference.md#全局记忆共享--workbuddy-memory)。
 
 ### 自动化
 
@@ -206,7 +206,7 @@ Toolkit 还包含一组从真实故障中长出来的保护机制：
 
 - WorkBuddy 5.6+ 加密凭据兼容；
 - 跨账号工作区 / 会话连续性；
-- 跨账号全局记忆单向发布（默认关闭，仅 `MEMORY.md` / `USER.md`）；
+- 跨账号全局记忆单向发布（默认关闭，`all` 范围含人格与指令文件，`prefs` 仅偏好与画像）；
 - 沙盒规则与会话状态修复；
 - 异常日志 / 临时文件生命周期限制；
 - IPC 超时与异常边界；

@@ -13,7 +13,7 @@
 | `wb-list` | 列出已保存账号 | 查看有哪些账号可用 |
 | `wb-status` | 查看当前账号状态 | 确认当前身份和健康状态 |
 | `wb-switch` | 切换到另一个已保存账号 | 不重新登录直接换号 |
-| `wb-memory` | 跨账号共享全局记忆（单向发布 `MEMORY.md` / `USER.md`） | 同一个人多个账号，偏好只维护一份 |
+| `wb-memory` | 跨账号共享全局记忆（单向发布整份账号档案，可 `--scope prefs` 收窄） | 同一个人多个账号，偏好/指令只维护一份 |
 | `wb-audit` | 巡检凭据健康度 | 检查过期或刷新问题 |
 | `wb-checkin` | 执行每日签到 / 连续任务 | 手动或定时日常任务 |
 | `wb-usage` | 查看使用量 / 积分流速 | 分析一段时间的消耗 |
@@ -78,17 +78,25 @@ wb-switch
 ### 跨账号共享全局记忆
 
 ```bash
-workbuddy memory on acc_55211   # 指定母版账号
-workbuddy memory status         # 查看母版、各账号记忆目录与文件大小
-workbuddy memory off            # 关闭共享
+workbuddy memory on acc_55211              # 指定母版账号（默认 all 范围）
+workbuddy memory on acc_55211 --scope prefs # 只共享 MEMORY.md / USER.md
+workbuddy memory status                    # 查看母版、范围、各账号档案文件
+workbuddy memory off                       # 关闭共享
 ```
 
-只共享 `MEMORY.md`（跨项目偏好）与 `USER.md`（用户画像），**单向发布**：切到其他账号时把母版内容复制过去，目标账号的改动不会回写母版。
+**单向发布**：切到其他账号时把母版档案复制过去，目标账号的改动不会回写母版。
+
+共享范围：
+
+| scope | 内容 |
+|---|---|
+| `all`（默认） | 档案目录下全部 `*.md`（`MEMORY` / `USER` / `AGENT` / `SOUL` / `IDENTITY` / `BOOTSTRAP`）+ `workspace-state.json` + 云端档案缓存（`memory/<uid>_memory.md`） |
+| `prefs` | 仅 `MEMORY.md` + `USER.md` |
 
 - 同步只在 `workbuddy switch` 时自动执行，没有手动同步命令；
 - 覆盖目标文件前会先备份到 `~/.workbuddy/cache/memory_share_backups/`（保留最近 20 份）；
-- 母版目录不存在、母版文件为空、目标就是母版本身，这三种情况一律跳过，不会写入空内容；
-- `SOUL.md` / `IDENTITY.md` / `AGENT.md` 不参与共享，避免两个账号的人格互相覆盖。
+- 母版目录不存在、母版文件为空、单个文件超过 2 MB、目标就是母版本身，一律跳过；
+- `all` 会连人格与指令一起覆盖；要保留两个账号各自的人格，请用 `--scope prefs`。
 
 ## 健康检查与诊断
 

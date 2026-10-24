@@ -1572,7 +1572,7 @@ class TestWorkBuddyCore(unittest.TestCase):
         cfg = workbuddy.load_memory_share_config()
         self.assertTrue(cfg["enabled"])
         self.assertEqual(cfg["source_uid"], "uid-master")
-        self.assertEqual(cfg["files"], ["MEMORY.md", "USER.md"])
+        self.assertEqual(cfg["scope"], "all")
         self.assertEqual(cfg["source_dir"], workbuddy.get_user_memory_dir("uid-master"))
 
         with patch("sys.stdout", io.StringIO()):
@@ -1737,6 +1737,100 @@ class TestWorkBuddyCore(unittest.TestCase):
             self.assertEqual(workbuddy.run_memory_cmd([]), 0)
             self.assertEqual(workbuddy.run_memory_cmd(["off"]), 0)
         self.assertFalse(workbuddy.load_memory_share_config()["enabled"])
+
+    def test_t70_all_scope_publishes_entire_profile(self):
+        """T70: all 范围发布整份账号档案（含 AGENT/SOUL/IDENTITY/BOOTSTRAP/状态文件）"""
+        self._put_profile("master", "uid-master", "Master")
+        self._put_profile("slave", "uid-slave", "Slave")
+        payload = {
+            "MEMORY.md": "记忆",
+            "USER.md": "画像",
+            "AGENT.md": "多 Agent 协议",
+            "SOUL.md": "人格",
+            "IDENTITY.md": "身份",
+            "BOOTSTRAP.md": "初始化",
+            "workspace-state.json": '{"version": 1}',
+        }
+        for name, text in payload.items():
+            self._put_memory("uid-master", name, text)
+        workbuddy.set_memory_share_source("master")
+
+        res = workbuddy.sync_shared_memory(workbuddy.get_profiles()["slave"])
+        self.assertEqual(res["scope"], "all")
+        created = {f["file"] for f in res["files"] if f["action"] == "created"}
+        self.assertEqual(created, set(payload))
+
+        dst_dir = workbuddy.get_user_memory_dir("uid-slave")
+        for name, text in payload.items():
+            with open(os.path.join(dst_dir, name), encoding="utf-8") as f:
+                self.assertEqual(f.read(), text, "{} 未按 all 范围发布".format(name))
+
+    def test_t71_prefs_scope_keeps_persona_separate(self):
+        """T71: prefs 范围只发布 MEMORY.md / USER.md，人格与指令文件保持独立"""
+        self._put_profile("master", "uid-master", "Master")
+        self._put_profile("slave", "uid-slave", "Slave")
+        self._put_memory("uid-master", "MEMORY.md", "记忆")
+        self._put_memory("uid-master", "AGENT.md", "母版协议")
+        self._put_memory("uid-slave", "AGENT.md", "副号自己的协议")
+        workbuddy.set_memory_share_source("master", scope="prefs")
+
+        res = workbuddy.sync_shared_memory(workbuddy.get_profiles()["slave"])
+        self.assertEqual({f["file"] for f in res["files"]}, {"MEMORY.md", "USER.md"})
+        dst_dir = workbuddy.get_user_memory_dir("uid-slave")
+        with open(os.path.join(dst_dir, "AGENT.md"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "副号自己的协议")
+
+    def test_t72_cloud_archive_renamed_to_target_uid(self):
+        """T72: 云端档案文件名内嵌 uid，发布时必须改名，否则目标账号读不到"""
+        self._put_profile("master", "uid-master", "Master")
+        self._put_profile("slave", "uid-slave", "Slave")
+        self._put_memory("uid-master", "MEMORY.md", "记忆")
+        flat = os.path.join(workbuddy.MEMORY_ROOT_DIR, "memory")
+        os.makedirs(flat, exist_ok=True)
+        src_cache = os.path.join(flat, "uid-master_memory.md")
+        with open(src_cache, "w", encoding="utf-8") as f:
+            f.write("服务端档案")
+        workbuddy.set_memory_share_source("master")
+
+        res = workbuddy.sync_shared_memory(workbuddy.get_profiles()["slave"])
+        cloud = [f for f in res["files"] if f["file"].startswith("memory/")]
+        self.assertEqual(len(cloud), 1)
+        self.assertEqual(cloud[0]["action"], "created")
+        dst_cache = os.path.join(flat, "uid-slave_memory.md")
+        self.assertTrue(os.path.isfile(dst_cache))
+        with open(dst_cache, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "服务端档案")
+        with open(src_cache, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "服务端档案", "母版云端档案不得被改写")
+
+    def test_t73_oversized_file_is_skipped(self):
+        """T73: 超过单文件上限的档案不搬运，避免把误放的大文件灌进目标账号"""
+        self._put_profile("master", "uid-master", "Master")
+        self._put_profile("slave", "uid-slave", "Slave")
+        self._put_memory("uid-master", "MEMORY.md", "记忆")
+        self._put_memory("uid-master", "AGENT.md", "x" * 100)
+        workbuddy.set_memory_share_source("master")
+
+        with patch.object(workbuddy, "MEMORY_SHARE_MAX_FILE_BYTES", 10):
+            res = workbuddy.sync_shared_memory(workbuddy.get_profiles()["slave"])
+        item = {f["file"]: f for f in res["files"]}["AGENT.md"]
+        self.assertEqual(item["action"], "too_large")
+        self.assertFalse(os.path.exists(os.path.join(workbuddy.get_user_memory_dir("uid-slave"), "AGENT.md")))
+        self.assertTrue(any("超过" in w for w in res["warnings"]))
+
+    def test_t74_bad_scope_rejected_and_cli_scope_flag(self):
+        """T74: 非法 scope 被拒绝；--scope prefs 能落盘"""
+        import io
+
+        self._put_profile("master", "uid-master", "Master")
+        bad = workbuddy.set_memory_share_source("master", scope="everything")
+        self.assertFalse(bad["ok"])
+        self.assertEqual(bad["action"], "bad_scope")
+        self.assertFalse(workbuddy.load_memory_share_config()["enabled"])
+
+        with patch("sys.stdout", io.StringIO()):
+            self.assertEqual(workbuddy.run_memory_cmd(["on", "master", "--scope", "prefs"]), 0)
+        self.assertEqual(workbuddy.load_memory_share_config()["scope"], "prefs")
 
 if __name__ == "__main__":
     unittest.main()

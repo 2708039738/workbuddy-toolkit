@@ -8,7 +8,7 @@ WorkBuddy Toolkit provides zero-touch local automation for WorkBuddy & CodeBuddy
 ## Core Capabilities & CLI Commands
 - `workbuddy login [alias]` (`wb-login`): Terminal 1:1 ANSI QR-code independent login without opening the Electron UI.
 - `workbuddy switch [alias]` (`wb-switch`): Instant multi-account profile switching in <1s without WeChat re-scanning.
-- `workbuddy memory on <alias>` (`wb-memory`): One-way publish of `MEMORY.md` / `USER.md` from a master account to other profiles on switch. Off by default; never writes back to the master; `SOUL.md` / `IDENTITY.md` / `AGENT.md` are excluded.
+- `workbuddy memory on <alias>` (`wb-memory`): One-way publish of the master account's whole profile (`MEMORY.md`, `USER.md`, `AGENT.md`, `SOUL.md`, `IDENTITY.md`, `BOOTSTRAP.md`, `workspace-state.json`, cloud memory cache) to other profiles on switch. Off by default; never writes back to the master; use `--scope prefs` to publish only `MEMORY.md` / `USER.md`.
 - `workbuddy checkin` (`wb-checkin`): Automated silent daily check-in and low-cost/free model conversation keepalive.
 - `workbuddy status` / `list` (`wb-status` / `wb-list`): Account inventory, token expiry inspection, and JSON output for agents.
 - `workbuddy doctor` (`wb-doctor`): Inspect credential encryption (Suite 1 / $wbEncrypted), runtime compatibility, and Seatbelt rule health.

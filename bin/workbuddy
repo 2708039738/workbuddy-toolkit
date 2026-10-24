@@ -2339,20 +2339,36 @@ def switch_to_profile(target_name, auto_restart=True, check_health=True):
     return True
 
 # ==============================================================================
-# 全局记忆共享（单向发布）
+# 全局记忆共享（账号档案单向发布）
 # ==============================================================================
 # 设计边界（与 workbuddy init 的会话共享是两件事）：
-#   1. 只共享本文件列出的两份：跨项目偏好（MEMORY.md）与用户画像（USER.md）。
-#      SOUL / IDENTITY / AGENT 不参与——它们回答"这个账号是谁"，同步过去等于让
-#      两个账号的人格互相覆盖，属于不可接受的副作用。
-#   2. 单向：只从母版发布到其他账号，目标账号的改动永远不回写母版。
-#   3. 覆盖前先备份目标文件；备份有保留上限，避免无限增长。
-#   4. 默认关闭，必须显式 `workbuddy memory on <账号>` 才生效。
+#   1. 单向：只从母版发布到其他账号，目标账号的改动永远不回写母版。
+#   2. 覆盖前先备份目标文件；备份有保留上限，避免无限增长。
+#   3. 默认关闭，必须显式 `workbuddy memory on <账号>` 才生效。
+#
+# 共享范围按 scope 分两档：
+#   all（默认）：母版账号档案目录下的全部 *.md（MEMORY / USER / AGENT / SOUL /
+#       IDENTITY / BOOTSTRAP …）、workspace-state.json，以及账号目录内 memory/
+#       与设备级 memory/<uid>_memory.md 云端档案缓存。
+#       语义是"这两个账号就是同一个人"，人格、指令、画像全部一致。
+#   prefs：只发 MEMORY.md + USER.md，保守用法。
+#
+# 默认档位是 all 而不是 prefs：调用方明确要求"共享账号之间的所有全局记忆"。
+# 只想共享偏好、保留各自人格时用 `--scope prefs`。
 
-MEMORY_SHARE_FILES = ("MEMORY.md", "USER.md")
+MEMORY_SHARE_MODE_ALL = "all"
+MEMORY_SHARE_MODE_PREFS = "prefs"
+MEMORY_SHARE_MODES = (MEMORY_SHARE_MODE_ALL, MEMORY_SHARE_MODE_PREFS)
+DEFAULT_MEMORY_SHARE_MODE = MEMORY_SHARE_MODE_ALL
 
-# 客户端 getUserLocalMemoryContent() 只注入前 4000 字，超长部分不会进上下文
+MEMORY_SHARE_CORE_FILES = ("MEMORY.md", "USER.md")
+MEMORY_SHARE_STATE_FILES = ("workspace-state.json",)
+
+# 客户端 getUserLocalMemoryContent() 只注入 MEMORY.md 前 4000 字，超长部分不进上下文
 MEMORY_INJECT_LIMIT = 4000
+
+# 单个档案文件上限：超过视为异常文件（误放的大日志/数据），拒绝搬运
+MEMORY_SHARE_MAX_FILE_BYTES = 2 * 1024 * 1024
 
 MEMORY_SHARE_BACKUP_KEEP = 20
 
@@ -2387,7 +2403,7 @@ def _default_memory_share_config():
         "source_uid": "",
         "source_alias": "",
         "source_dir": "",
-        "files": list(MEMORY_SHARE_FILES),
+        "scope": DEFAULT_MEMORY_SHARE_MODE,
         "updated_at": None,
         "last_sync": {},
     }
@@ -2407,9 +2423,9 @@ def load_memory_share_config():
     cfg["source_uid"] = str(raw.get("source_uid") or "").strip()
     cfg["source_alias"] = str(raw.get("source_alias") or "").strip()
     cfg["source_dir"] = str(raw.get("source_dir") or "").strip()
+    scope = str(raw.get("scope") or "").strip().lower()
+    cfg["scope"] = scope if scope in MEMORY_SHARE_MODES else DEFAULT_MEMORY_SHARE_MODE
     cfg["updated_at"] = raw.get("updated_at")
-    files = [n for n in (raw.get("files") or []) if n in MEMORY_SHARE_FILES]
-    cfg["files"] = files or list(MEMORY_SHARE_FILES)
     last = raw.get("last_sync")
     cfg["last_sync"] = last if isinstance(last, dict) else {}
     return cfg
@@ -2481,16 +2497,73 @@ def atomic_write_text(path, text):
         raise
 
 
-def sync_shared_memory(target_profile):
-    """把母版的 MEMORY.md / USER.md 单向发布到目标账号。
+def _collect_share_entries(source_dir, target_dir, source_uid, target_uid, scope):
+    """列出本次要发布的文件：每项 {label, src, dst, limit}。
 
-    返回 dict（不打印）：ok / action / source_alias / target_alias / files / warnings
+    all 档取母版档案目录根下全部普通 *.md（含 AGENT.md / SOUL.md / IDENTITY.md /
+    BOOTSTRAP.md）+ workspace-state.json，再加两处云端档案缓存；
+    prefs 档只取 MEMORY.md / USER.md。
+    """
+    entries = []
+
+    def add_file(label, src_path, dst_path):
+        limit = MEMORY_INJECT_LIMIT if label.upper() == "MEMORY.MD" else None
+        entries.append({"label": label, "src": src_path, "dst": dst_path, "limit": limit})
+
+    if scope == MEMORY_SHARE_MODE_PREFS:
+        for name in MEMORY_SHARE_CORE_FILES:
+            add_file(name, os.path.join(source_dir, name), os.path.join(target_dir, name))
+        return entries
+
+    try:
+        names = sorted(os.listdir(source_dir))
+    except OSError:
+        names = []
+    for name in names:
+        path = os.path.join(source_dir, name)
+        if os.path.islink(path) or not os.path.isfile(path):
+            continue
+        if not (name.lower().endswith(".md") or name in MEMORY_SHARE_STATE_FILES):
+            continue
+        add_file(name, path, os.path.join(target_dir, name))
+
+    # 云端档案缓存（Layer 1）：文件名内嵌 uid，必须改成目标 uid 才会被读到
+    flat_dir = os.path.join(MEMORY_ROOT_DIR, "memory")
+    for suffix in ("_memory.md", "_memery.md"):
+        src_path = os.path.join(flat_dir, "{}{}".format(source_uid, suffix))
+        if os.path.isfile(src_path):
+            add_file("memory/{}{}".format(target_uid, suffix), src_path,
+                     os.path.join(flat_dir, "{}{}".format(target_uid, suffix)))
+
+    src_mem_dir = os.path.join(source_dir, "memory")
+    try:
+        mem_names = sorted(os.listdir(src_mem_dir))
+    except OSError:
+        mem_names = []
+    for name in mem_names:
+        src_path = os.path.join(src_mem_dir, name)
+        if os.path.islink(src_path) or not os.path.isfile(src_path):
+            continue
+        new_name = name.replace(source_uid, target_uid) if source_uid in name else name
+        add_file("memory/{}".format(new_name), src_path,
+                 os.path.join(target_dir, "memory", new_name))
+    return entries
+
+
+def sync_shared_memory(target_profile):
+    """把母版账号档案单向发布到目标账号。
+
+    scope=all 时搬运全部 *.md（含 AGENT.md / SOUL.md / IDENTITY.md / BOOTSTRAP.md）、
+    workspace-state.json 与云端档案缓存；scope=prefs 只发 MEMORY.md / USER.md。
+
+    返回 dict（不打印）：ok / action / scope / source_alias / target_alias / files / warnings
     action 取值：disabled | no_source | no_target_uid | source_is_target |
                 source_missing | synced | noop
     """
     result = {
         "ok": False,
         "action": "disabled",
+        "scope": DEFAULT_MEMORY_SHARE_MODE,
         "source_alias": "",
         "target_alias": "",
         "files": [],
@@ -2501,6 +2574,9 @@ def sync_shared_memory(target_profile):
     if not cfg.get("enabled"):
         result["ok"] = True
         return result
+
+    scope = cfg.get("scope") or DEFAULT_MEMORY_SHARE_MODE
+    result["scope"] = scope
 
     target = target_profile or {}
     result["target_alias"] = str(target.get("nickname") or "")
@@ -2524,33 +2600,48 @@ def sync_shared_memory(target_profile):
     src_dir = cfg.get("source_dir") or get_user_memory_dir(src_uid)
     if not os.path.isdir(src_dir):
         result["action"] = "source_missing"
-        result["warnings"].append("母版记忆目录不存在：{}".format(src_dir))
+        result["warnings"].append("母版档案目录不存在：{}".format(src_dir))
         return result
 
     dst_dir = get_user_memory_dir(dst_uid, _profile_enterprise_id(target))
     if not dst_dir:
         result["action"] = "no_target_uid"
-        result["warnings"].append("无法解析目标账号的记忆目录")
+        result["warnings"].append("无法解析目标账号的档案目录")
+        return result
+
+    entries = _collect_share_entries(src_dir, dst_dir, src_uid, dst_uid, scope)
+    if not entries:
+        result["action"] = "source_missing"
+        result["warnings"].append("母版档案目录里没有可发布的文件：{}".format(src_dir))
         return result
 
     wrote = False
-    for name in cfg.get("files") or list(MEMORY_SHARE_FILES):
-        src_path = os.path.join(src_dir, name)
-        dst_path = os.path.join(dst_dir, name)
-        item = {"file": name, "action": "missing", "backup": None, "bytes": 0, "truncated": False}
+    for entry in entries:
+        label = entry["label"]
+        src_path = entry["src"]
+        dst_path = entry["dst"]
+        item = {"file": label, "action": "missing", "backup": None, "bytes": 0, "truncated": False}
         if not os.path.isfile(src_path):
+            result["files"].append(item)
+            continue
+        size = os.path.getsize(src_path)
+        if size > MEMORY_SHARE_MAX_FILE_BYTES:
+            item["action"] = "too_large"
+            item["bytes"] = size
+            result["warnings"].append("{} 超过 {} 字节，已跳过".format(label, MEMORY_SHARE_MAX_FILE_BYTES))
             result["files"].append(item)
             continue
         try:
             with open(src_path, "r", encoding="utf-8") as f:
                 text = f.read()
-        except OSError as e:
+        except (OSError, UnicodeDecodeError) as e:
             item["action"] = "error"
-            result["warnings"].append("读取母版 {} 失败: {}".format(name, e))
+            result["warnings"].append("读取母版 {} 失败: {}".format(label, e))
             result["files"].append(item)
             continue
-        item["bytes"] = len(text)
-        item["truncated"] = len(text) > MEMORY_INJECT_LIMIT
+        item["bytes"] = len(text.encode("utf-8"))
+        limit = entry.get("limit")
+        item["truncated"] = bool(limit and len(text) > limit)
         if not text.strip():
             item["action"] = "empty"
             result["files"].append(item)
@@ -2558,17 +2649,17 @@ def sync_shared_memory(target_profile):
 
         existing = None
         if os.path.islink(dst_path):
-            # 有人会手工把目标账号的 MEMORY.md 软链到别处；直接原子替换会把链接
-            # 变成普通文件，静默破坏他原本的共享方式。宁可跳过并说明。
+            # 有人会手工把目标账号的档案软链到别处；直接原子替换会把链接变成普通文件，
+            # 静默破坏他原本的共享方式。宁可跳过并说明。
             item["action"] = "skipped_symlink"
-            result["warnings"].append("{} 是符号链接，已跳过（不覆盖手工链接）".format(name))
+            result["warnings"].append("{} 是符号链接，已跳过（不覆盖手工链接）".format(label))
             result["files"].append(item)
             continue
         if os.path.isfile(dst_path):
             try:
                 with open(dst_path, "r", encoding="utf-8") as f:
                     existing = f.read()
-            except OSError:
+            except (OSError, UnicodeDecodeError):
                 existing = None
 
         if existing == text:
@@ -2578,13 +2669,13 @@ def sync_shared_memory(target_profile):
 
         try:
             if existing is not None:
-                item["backup"] = backup_memory_file(dst_path, dst_uid, name)
+                item["backup"] = backup_memory_file(dst_path, dst_uid, label.replace("/", "_"))
             atomic_write_text(dst_path, text)
             item["action"] = "updated" if existing is not None else "created"
             wrote = True
         except OSError as e:
             item["action"] = "error"
-            result["warnings"].append("写入 {} 失败: {}".format(name, e))
+            result["warnings"].append("写入 {} 失败: {}".format(label, e))
         result["files"].append(item)
 
     result["ok"] = not any(f["action"] == "error" for f in result["files"])
@@ -2593,6 +2684,7 @@ def sync_shared_memory(target_profile):
     cfg.setdefault("last_sync", {})[dst_uid] = {
         "at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "action": result["action"],
+        "scope": scope,
         "source_uid": src_uid,
     }
     try:
@@ -2602,10 +2694,14 @@ def sync_shared_memory(target_profile):
     return result
 
 
-def set_memory_share_source(target_name):
+def set_memory_share_source(target_name, scope=DEFAULT_MEMORY_SHARE_MODE):
     """把指定账号设为记忆共享母版（单向发布的来源）。"""
     result = {"ok": False, "action": "not_found", "alias": None, "uid": None,
-              "dir": None, "dir_exists": False, "files": [], "message": ""}
+              "dir": None, "dir_exists": False, "scope": scope, "files": [], "message": ""}
+    if scope not in MEMORY_SHARE_MODES:
+        result["action"] = "bad_scope"
+        result["message"] = "未知的共享范围: {}（可选 {}）".format(scope, " / ".join(MEMORY_SHARE_MODES))
+        return result
     profiles = get_profiles()
     alias, target = resolve_profile_target(profiles, target_name, allow_uid_prefix=True, quiet=True)
     if not target:
@@ -2622,8 +2718,8 @@ def set_memory_share_source(target_name):
     mem_dir = get_user_memory_dir(uid, _profile_enterprise_id(target))
     result["dir"] = mem_dir
     result["dir_exists"] = os.path.isdir(mem_dir)
-    for name in MEMORY_SHARE_FILES:
-        path = os.path.join(mem_dir, name)
+    for entry in _collect_share_entries(mem_dir, mem_dir, uid, uid, scope):
+        path = entry["src"]
         exists = os.path.isfile(path)
         size = os.path.getsize(path) if exists else 0
         # 客户端按"字符数"截断，不是字节数：中文 4000 字约 12 KB，
@@ -2633,10 +2729,11 @@ def set_memory_share_source(target_name):
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     chars = len(f.read())
-            except OSError:
+            except (OSError, UnicodeDecodeError):
                 chars = 0
-        result["files"].append({"file": name, "exists": exists, "bytes": size,
-                                "chars": chars, "truncated": chars > MEMORY_INJECT_LIMIT})
+        limit = entry.get("limit")
+        result["files"].append({"file": entry["label"], "exists": exists, "bytes": size,
+                                "chars": chars, "truncated": bool(limit and chars > limit)})
 
     cfg = load_memory_share_config()
     cfg.update({
@@ -2644,13 +2741,13 @@ def set_memory_share_source(target_name):
         "source_uid": uid,
         "source_alias": alias,
         "source_dir": mem_dir,
-        "files": list(MEMORY_SHARE_FILES),
+        "scope": scope,
         "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
     })
     save_memory_share_config(cfg)
     result["ok"] = True
     result["action"] = "enabled"
-    result["message"] = "已启用全局记忆共享，母版: {}".format(alias)
+    result["message"] = "已启用全局记忆共享，母版: {}（范围: {}）".format(alias, scope)
     return result
 
 
@@ -2665,20 +2762,35 @@ def disable_memory_share():
 
 
 def get_memory_share_status():
-    """汇总共享配置与各账号记忆目录现状，供 memory status / 排障使用。"""
+    """汇总共享配置与各账号档案现状，供 memory status / 排障使用。"""
     cfg = load_memory_share_config()
+    scope = cfg.get("scope") or DEFAULT_MEMORY_SHARE_MODE
     accounts = []
     for alias, prof in sorted(get_profiles().items()):
         uid = str(prof.get("uid") or "").strip()
         mem_dir = get_user_memory_dir(uid, _profile_enterprise_id(prof)) if uid else None
+        names = []
+        if mem_dir and os.path.isdir(mem_dir):
+            if scope == MEMORY_SHARE_MODE_PREFS:
+                names = [n for n in MEMORY_SHARE_CORE_FILES
+                         if os.path.isfile(os.path.join(mem_dir, n))]
+            else:
+                try:
+                    names = sorted(
+                        n for n in os.listdir(mem_dir)
+                        if not os.path.islink(os.path.join(mem_dir, n))
+                        and os.path.isfile(os.path.join(mem_dir, n))
+                        and (n.lower().endswith(".md") or n in MEMORY_SHARE_STATE_FILES)
+                    )
+                except OSError:
+                    names = []
         entry = {"alias": alias, "uid": uid, "nickname": prof.get("nickname") or alias,
                  "dir": mem_dir, "dir_exists": bool(mem_dir and os.path.isdir(mem_dir)),
-                 "files": [], "is_source": bool(uid and uid == cfg.get("source_uid"))}
-        for name in MEMORY_SHARE_FILES:
-            path = os.path.join(mem_dir, name) if mem_dir else None
-            exists = bool(path and os.path.isfile(path))
-            entry["files"].append({"file": name, "exists": exists,
-                                   "bytes": os.path.getsize(path) if exists else 0})
+                 "files": [], "file_count": len(names),
+                 "is_source": bool(uid and uid == cfg.get("source_uid"))}
+        for name in names:
+            path = os.path.join(mem_dir, name)
+            entry["files"].append({"file": name, "exists": True, "bytes": os.path.getsize(path)})
         accounts.append(entry)
     return {"config": cfg, "accounts": accounts}
 
@@ -2696,25 +2808,29 @@ def _sync_memory_on_switch(target):
     if action == "source_missing":
         print(f"{COLOR_YELLOW}  [记忆] 母版目录不存在，本次跳过（workbuddy memory status 查看）{COLOR_RESET}")
         return
-    labels = {
-        "created": "已写入",
-        "updated": "已覆盖并备份",
-        "same": "未变化",
-        "missing": "母版缺少",
-        "empty": "母版为空",
-        "error": "失败",
-        "skipped_symlink": "符号链接，已跳过",
-    }
-    parts = []
-    truncated = False
+    counts = {"created": 0, "updated": 0, "same": 0, "missing": 0,
+              "empty": 0, "error": 0, "skipped_symlink": 0, "too_large": 0}
+    truncated = []
     for item in res.get("files") or []:
-        label = labels.get(item.get("action"), item.get("action"))
-        parts.append("{} {}".format(item.get("file"), label))
-        truncated = truncated or bool(item.get("truncated"))
+        key = item.get("action")
+        counts[key] = counts.get(key, 0) + 1
+        if item.get("truncated") and key in ("created", "updated"):
+            truncated.append(item.get("file"))
+    scope = res.get("scope") or DEFAULT_MEMORY_SHARE_MODE
+    parts = []
+    if counts["created"]:
+        parts.append("新建 {} 个".format(counts["created"]))
+    if counts["updated"]:
+        parts.append("覆盖 {} 个".format(counts["updated"]))
+    if counts["same"]:
+        parts.append("未变化 {} 个".format(counts["same"]))
+    if counts["missing"]:
+        parts.append("母版缺少 {} 个".format(counts["missing"]))
     if parts:
-        print("  [记忆] " + "；".join(parts))
+        print("  [记忆] 已按 {} 范围发布：{}".format(scope, "，".join(parts)))
     if truncated:
-        print(f"{COLOR_YELLOW}  [记忆] 内容超过 {MEMORY_INJECT_LIMIT} 字，客户端只注入前 {MEMORY_INJECT_LIMIT} 字{COLOR_RESET}")
+        print(f"{COLOR_YELLOW}  [记忆] {', '.join(truncated)} 超过 {MEMORY_INJECT_LIMIT} 字，"
+              f"客户端只注入前 {MEMORY_INJECT_LIMIT} 字{COLOR_RESET}")
     for warning in res.get("warnings") or []:
         print(f"{COLOR_YELLOW}  [记忆] {warning}{COLOR_RESET}")
 
@@ -4565,25 +4681,47 @@ def run_interactive_tool_cmd(args=None):
     code = interactive_tool.run_interactive_tool(ctx, args=args)
     sys.exit(code)
 
-MEMORY_USAGE = "用法: workbuddy memory [on <账号名> | off | status] [--json]"
+MEMORY_USAGE = "用法: workbuddy memory [on <账号名> [--scope all|prefs] | off | status] [--json]"
 
 def _parse_memory_cli_args(args_list):
-    """解析 memory 子命令。返回 (action, target, as_json)。
+    """解析 memory 子命令。返回 (action, target, scope, as_json)。
 
-    `workbuddy memory <别名>` 等价于 `on <别名>`，少打一个词。
+    `workbuddy memory <别名>` 等价于 `on <别名>`，少打一个词；
+    scope 缺省交给 set_memory_share_source 用默认档（all）。
     """
     as_json = any(a in ("--json", "-j") for a in args_list)
-    clean = [a for a in args_list if a not in ("--json", "-j")]
+    scope = None
+    clean = []
+    i = 0
+    while i < len(args_list):
+        arg = args_list[i]
+        if arg in ("--json", "-j"):
+            i += 1
+            continue
+        if arg == "--scope" and i + 1 < len(args_list):
+            scope = args_list[i + 1].strip().lower()
+            i += 2
+            continue
+        if arg.startswith("--scope="):
+            scope = arg.split("=", 1)[1].strip().lower()
+            i += 1
+            continue
+        if arg in ("--prefs", "--memory-only"):
+            scope = MEMORY_SHARE_MODE_PREFS
+            i += 1
+            continue
+        clean.append(arg)
+        i += 1
     if not clean:
-        return "status", None, as_json
+        return "status", None, scope, as_json
     head = clean[0].lower()
     if head in ("on", "share", "enable", "use"):
-        return "on", (clean[1] if len(clean) > 1 else None), as_json
+        return "on", (clean[1] if len(clean) > 1 else None), scope, as_json
     if head in ("off", "disable", "stop", "none"):
-        return "off", None, as_json
+        return "off", None, scope, as_json
     if head in ("status", "show", "info"):
-        return "status", None, as_json
-    return "on", clean[0], as_json
+        return "status", None, scope, as_json
+    return "on", clean[0], scope, as_json
 
 def run_memory_cmd(args_list):
     """`workbuddy memory` 子命令入口。退出码: 0 成功，1 失败，2 参数缺失。"""
@@ -4591,23 +4729,29 @@ def run_memory_cmd(args_list):
         print(MEMORY_USAGE)
         print("  on <账号名>  指定母版账号并开启单向发布（别名/昵称/UID 前缀均可）")
         print("  off          关闭共享，已同步出去的文件不会回收")
-        print("  status       查看母版、各账号记忆目录与文件大小")
+        print("  status       查看母版、共享范围与各账号档案文件")
+        print("  --scope all  发布账号档案下全部 *.md（含 AGENT/SOUL/IDENTITY/BOOTSTRAP）")
+        print("               + workspace-state.json + 云端档案缓存（默认）")
+        print("  --scope prefs 只发布 MEMORY.md 与 USER.md")
         print("  --json       以 JSON 输出，便于脚本消费")
         print("  同步时机: 仅 workbuddy switch 到其他账号时自动执行，不回写母版")
         return 0
-    action, target, as_json = _parse_memory_cli_args(args_list)
+    action, target, scope, as_json = _parse_memory_cli_args(args_list)
 
     if action == "on":
         if not target:
             print(f"{COLOR_RED}请指定母版账号，例如: workbuddy memory on acc_55211{COLOR_RESET}")
             print(MEMORY_USAGE)
             return 2
-        res = set_memory_share_source(target)
+        res = set_memory_share_source(target, scope=scope or DEFAULT_MEMORY_SHARE_MODE)
         if as_json:
             print(json.dumps(res, ensure_ascii=False, indent=2))
         elif not res.get("ok"):
             print(f"{COLOR_RED}错误: {res.get('message')}{COLOR_RESET}")
-            print("提示: 用 workbuddy list 查看已保存账号")
+            if res.get("action") == "bad_scope":
+                print("可选范围: all / prefs")
+            else:
+                print("提示: 用 workbuddy list 查看已保存账号")
         else:
             print(f"{COLOR_GREEN}✔ {res['message']}{COLOR_RESET}")
             print(f"  母版目录: {res['dir']}")
@@ -4615,12 +4759,20 @@ def run_memory_cmd(args_list):
                 print(f"{COLOR_YELLOW}  ▲ 该目录尚不存在：账号还没在客户端登录过。"
                       f"首次同步会跳过，登录产生记忆后自动生效。{COLOR_RESET}")
             else:
-                for item in res.get("files") or []:
-                    if item.get("exists"):
-                        note = "（超过 4000 字，客户端只注入前 4000 字）" if item.get("truncated") else ""
-                        print(f"  {item['file']}: {item['bytes']:,} 字节 / {item.get('chars', 0):,} 字{note}")
-                    else:
-                        print(f"  {item['file']}: 尚无内容")
+                present = [i for i in (res.get("files") or []) if i.get("exists")]
+                detail = "、".join(
+                    "{} {:,}B{}".format(i["file"], i["bytes"],
+                                        "*" if i.get("truncated") else "")
+                    for i in present
+                )
+                print(f"  待发布 {len(present)} 个文件: {detail or '(无)'}")
+                if any(i.get("truncated") for i in present):
+                    print(f"{COLOR_YELLOW}  * 带星号的超过 {MEMORY_INJECT_LIMIT} 字，"
+                          f"客户端只注入前 {MEMORY_INJECT_LIMIT} 字{COLOR_RESET}")
+            if res.get("scope") == MEMORY_SHARE_MODE_ALL:
+                print(f"{COLOR_YELLOW}  ▲ all 范围包含 SOUL / IDENTITY / AGENT / BOOTSTRAP，"
+                      f"目标账号的人格与指令将与母版完全一致{COLOR_RESET}")
+                print("    只想共享偏好、保留各自人格: workbuddy memory on <账号> --scope prefs")
             print(f"  {COLOR_CYAN}同步时机: workbuddy switch 到其他账号时自动发布；不会回写母版{COLOR_RESET}")
         return 0 if res.get("ok") else 1
 
@@ -4641,14 +4793,13 @@ def run_memory_cmd(args_list):
         return 0
     cfg = status["config"]
     if cfg.get("enabled"):
-        print(f"{COLOR_GREEN}全局记忆共享: 已启用（单向发布）{COLOR_RESET}")
+        print(f"{COLOR_GREEN}全局记忆共享: 已启用（单向发布，范围 {cfg.get('scope')}）{COLOR_RESET}")
         print(f"  母版: {cfg.get('source_alias') or '(未知)'}  {str(cfg.get('source_uid') or '')[:8]}...")
         print(f"  目录: {cfg.get('source_dir') or '(未记录)'}")
-        print(f"  文件: {' / '.join(cfg.get('files') or list(MEMORY_SHARE_FILES))}")
         print("  时机: workbuddy switch 到其他账号时自动执行")
     else:
         print(f"{COLOR_YELLOW}全局记忆共享: 未启用{COLOR_RESET}")
-        print("  开启: workbuddy memory on <母版账号>")
+        print("  开启: workbuddy memory on <母版账号> [--scope all|prefs]")
     last = cfg.get("last_sync") or {}
     if last:
         recent = sorted(last.items(), key=lambda kv: str(kv[1].get("at") or ""))[-3:]
@@ -4656,17 +4807,16 @@ def run_memory_cmd(args_list):
         for uid, info in recent:
             print(f"    {str(uid)[:8]}...  {info.get('at') or '?'}  {info.get('action') or '?'}")
     if status["accounts"]:
-        print("  账号记忆目录:")
+        print("  账号档案目录:")
         for acc in status["accounts"]:
             mark = f"{COLOR_CYAN}[母版]{COLOR_RESET}" if acc["is_source"] else "      "
             state = "" if acc["dir_exists"] else f"{COLOR_YELLOW}(目录不存在){COLOR_RESET}"
             print(f"    {mark} {acc['alias']:<12} {acc['nickname'][:10]:<10} {state}")
             if acc["dir_exists"]:
-                detail = "  ".join(
-                    "{} {}".format(f["file"], f"{f['bytes']:,}B" if f["exists"] else "—")
-                    for f in acc["files"]
-                )
-                print(f"             {detail}")
+                core = {f["file"]: f for f in acc["files"]}
+                mem = core.get("MEMORY.md")
+                mem_txt = "MEMORY.md {:,}B".format(mem["bytes"]) if mem else "MEMORY.md —"
+                print(f"             {acc['file_count']} 个文件  {mem_txt}")
     return 0
 
 def print_help():

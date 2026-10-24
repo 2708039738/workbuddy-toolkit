@@ -97,7 +97,7 @@ class TestInstallersE2E(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(bin_dir, "workbuddy-tool")))
 
         # 3. 造出回收站与"始终保留"的哨兵文件：
-        #    卸载器要清掉 auth_profiles_trash/（已删除凭证副本），但不能碰 auth_profiles/。
+        #    卸载器要清掉 auth_profiles_trash/（已删除凭证与记忆归档），但不能碰 auth_profiles/。
         trash_dir = os.path.join(self.temp_home, ".workbuddy", "auth_profiles_trash")
         profiles_dir = os.path.join(self.temp_home, ".workbuddy", "auth_profiles")
         os.makedirs(trash_dir, exist_ok=True)

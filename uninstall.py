@@ -12,7 +12,7 @@ https://github.com/FlapPearLabs/workbuddy-toolkit
     python3 uninstall.py --keep-config  # 保留 failover_router.json / log_guard.json 等配置
 
 始终保留: ~/.workbuddy/auth_profiles/ 下已保存的账号凭证。
-同时清理: ~/.workbuddy/auth_profiles_trash/ 中 workbuddy remove 移入的已删除凭证副本。
+同时清理: ~/.workbuddy/auth_profiles_trash/ 中 workbuddy remove 移入的已删除凭证与记忆归档副本。
 """
 
 import os
@@ -33,7 +33,7 @@ DB_FILE = os.path.join(WORKBUDDY_DIR, "workbuddy.db")
 TOOLKIT_DIR = os.path.join(WORKBUDDY_DIR, "toolkit")
 MODELS_JSON = os.path.join(WORKBUDDY_DIR, "models.json")
 ROUTER_CONFIG = os.path.join(WORKBUDDY_DIR, "failover_router.json")
-# workbuddy remove 移入的已删除凭证副本：卸载时必须一起清掉，否则磁盘上仍留有凭据。
+# workbuddy remove 移入的已删除凭证与记忆归档：卸载时必须一起清掉，否则磁盘上仍留有凭据/人格明文。
 # 注意与 auth_profiles/ 区分——后者是用户已保存的账号凭证，始终保留。
 AUTH_PROFILES_TRASH = os.path.join(WORKBUDDY_DIR, "auth_profiles_trash")
 

@@ -2671,6 +2671,10 @@ def archive_account_memory(uid, alias, stem, purge=False):
             except OSError:
                 pass
             result["bundle"] = bundle
+            result["items"] = [
+                {"kind": item.get("kind"), "path": item.get("src")}
+                for item in recovery_items
+            ]
             result["message"] = (
                 "账号档案移动失败: {}；{} 项未能放回原处，副本保留在 {}".format(
                     e, len(rollback_failed), bundle)

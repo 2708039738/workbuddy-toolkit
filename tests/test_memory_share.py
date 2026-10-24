@@ -110,7 +110,8 @@ class TestMemoryHub(unittest.TestCase):
         """T06: 原文接近 4000 字时，共享段落让位，原文一个字都不截"""
         origin = "# 记忆\n" + "\n".join("- 自有条目 {:04d} {}".format(i, "内" * 60) for i in range(50))
         self._write(self.acc_a, origin)
-        self._write(self.acc_b, "# 记忆\n" + "\n".join("- 他人条目 {} {}".format(i, "外" * 60) for i in range(10)))
+        self._write(self.acc_b, "# 记忆\n" + "\n".join(
+            "- 必须遵守外来准则 {:02d} {}".format(i, "外" * 60) for i in range(10)))
         ms.collect([self.acc_a, self.acc_b], root=self.root)
         res = ms.apply_account(self.acc_a, root=self.root)
 
@@ -168,6 +169,156 @@ class TestMemoryHub(unittest.TestCase):
         self.assertTrue(row["snapshot"])
         self.assertGreater(row["own_chars"], 0)
         self.assertGreaterEqual(row["shared_entries"], 1)
+
+
+class TestPublishScope(unittest.TestCase):
+    """发布口径：只发布跨账号仍然成立的规则，不发布事实与本机细节。"""
+
+    def test_20_publish_level_classifies_by_nature(self):
+        """T20: 红线 / 显式指令 / 项目约定 / 习惯 / 事实 分级正确"""
+        self.assertEqual(ms.publish_level("- 禁止把 token 写进仓库"), 0)
+        self.assertEqual(ms.publish_level("- 以后都叫我 ser"), 1)
+        self.assertEqual(ms.publish_level("- 提交前跑全量测试"), 2)
+        self.assertEqual(ms.publish_level("- 偏好简洁回答"), 3)
+        self.assertEqual(ms.publish_level("- 项目路径在 D:/work/pr"), 4)
+        self.assertEqual(ms.publish_level("- 用户似乎偏好简洁"), 4, "模糊措辞按推断处理")
+
+    def test_21_publishable_respects_budget(self):
+        """T21: 预算按字符硬约束，装不下就停，不静默超发"""
+        entries = [{"text": "- 必须遵守准则 {:02d} {}".format(i, "规" * 40), "quality": 6.0}
+                   for i in range(30)]
+        picked, stats = ms.publishable(entries, budget=300)
+        self.assertLessEqual(stats["used"], 300)
+        self.assertGreater(stats["budget"], 0)
+        self.assertLess(len(picked), 30)
+        for e in picked:
+            self.assertLessEqual(len(e["text"]) + 3, 300)
+
+    def test_22_local_fact_never_published(self):
+        """T22: 含盘符路径/账号的条目一律不跨账号"""
+        entries = [{"text": "- 项目在 D:/work/pr 下", "quality": 9.0},
+                   {"text": "- 联系 ser@example.com", "quality": 9.0}]
+        picked, stats = ms.publishable(entries)
+        self.assertEqual(picked, [])
+        self.assertEqual(stats["local_fact"], 2)
+
+    def test_23_apply_does_not_leak_project_facts(self):
+        """T23: B 号的项目事实不会出现在 A 号，规则会"""
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        a = {"alias": "alpha", "uid": "uid-a"}
+        b = {"alias": "beta", "uid": "uid-b"}
+        for acc, text in ((a, "# 记忆\n- 提交前必须跑测试\n"),
+                          (b, "# 记忆\n- 项目路径在 D:/work/pr\n- 以后都叫我 ser\n")):
+            d = ms.memory_dir(root, acc["uid"])
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "MEMORY.md"), "w", encoding="utf-8") as f:
+                f.write(text)
+
+        ms.collect([a, b], root=root)
+        res = ms.apply_account(a, root=root)
+        text = open(os.path.join(ms.memory_dir(root, "uid-a"), "MEMORY.md"),
+                    encoding="utf-8").read()
+        self.assertIn("叫我 ser", text)
+        self.assertNotIn("D:/work/pr", text, "项目事实不能跨账号")
+        self.assertGreaterEqual(res["skipped"]["local_fact"], 1)
+
+    def test_24_published_block_stays_inside_window(self):
+        """T24: 共享段落必须落在 4000 字窗口内，否则写了等于没写"""
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        a = {"alias": "alpha", "uid": "uid-a"}
+        b = {"alias": "beta", "uid": "uid-b"}
+        origin = "# 记忆\n" + "\n".join("- 自有事实 {:04d} {}".format(i, "内" * 50) for i in range(60))
+        for acc, text in ((a, origin),
+                          (b, "# 记忆\n" + "\n".join(
+                              "- 必须遵守外来准则 {:02d} {}".format(i, "外" * 50) for i in range(12)))):
+            d = ms.memory_dir(root, acc["uid"])
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "MEMORY.md"), "w", encoding="utf-8") as f:
+                f.write(text)
+
+        ms.collect([a, b], root=root)
+        res = ms.apply_account(a, root=root)
+        text = open(os.path.join(ms.memory_dir(root, "uid-a"), "MEMORY.md"), encoding="utf-8").read()
+        self.assertGreaterEqual(res["shared"], 1)
+        self.assertLessEqual(len(text.strip()), ms.INJECT_LIMIT, "总字数不能越过注入上限")
+        self.assertTrue(text.startswith(origin.rstrip()), "原文优先")
+
+    def test_25_forget_leaves_tombstone_and_blocks_resurrection(self):
+        """T25: forget 之后重新 collect 也不能把条目收回来"""
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        acc = {"alias": "alpha", "uid": "uid-a"}
+        d = ms.memory_dir(root, acc["uid"])
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "MEMORY.md"), "w", encoding="utf-8") as f:
+            f.write("# 记忆\n- 必须提交前跑全量测试\n- 必须用中文回复\n")
+
+        ms.collect([acc], root=root)
+        preview = ms.forget("跑全量测试", root=root)
+        self.assertTrue(preview["matched"])
+        self.assertFalse(preview["applied"], "默认只预览")
+        self.assertEqual(len(ms.load_library(root)["entries"]), 2)
+
+        res = ms.forget("跑全量测试", root=root, apply=True)
+        self.assertTrue(res["applied"])
+        remaining = [e["text"] for e in ms.load_library(root)["entries"]]
+        self.assertEqual(remaining, ["- 必须用中文回复"])
+
+        stats = ms.collect([acc], root=root)
+        self.assertEqual(stats["forgotten"], 1, "账号文件里还在，但不能被收回库里")
+        self.assertEqual(len(ms.load_library(root)["entries"]), 1)
+
+    def test_26_conflicting_rules_only_publish_one(self):
+        """T26: 只差一个否定词的两条规则，标冲突且只注入一条"""
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        a = {"alias": "alpha", "uid": "uid-a"}
+        b = {"alias": "beta", "uid": "uid-b"}
+        for acc, text in ((a, "# 记忆\n- 提交前必须跑全量测试\n"),
+                          (b, "# 记忆\n- 提交前不要跑全量测试\n")):
+            d = ms.memory_dir(root, acc["uid"])
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "MEMORY.md"), "w", encoding="utf-8") as f:
+                f.write(text)
+
+        stats = ms.collect([a, b], root=root)
+        self.assertEqual(stats["conflicts"], 1)
+        lib = ms.load_library(root)
+        self.assertEqual(len(lib["entries"]), 2, "冲突双方都要留在库里")
+        self.assertEqual(sum(1 for e in lib["entries"] if e.get("suppressed")), 1)
+
+        picked, sk = ms.publishable(ms.active_entries(lib))
+        self.assertEqual(len(picked), 1)
+        self.assertEqual(sk["conflict"], 1)
+
+
+class TestLock(unittest.TestCase):
+    def test_27_lock_is_reentrant(self):
+        """T27: 同一进程可重入（apply_all 内层再取锁不能自锁）"""
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        with ms.file_lock(root):
+            with ms.file_lock(root):
+                self.assertIn(os.path.join(ms.hub_dir(root), ".hub.lock"), ms._lock_state)
+
+    def test_28_apply_all_under_single_lock(self):
+        """T28: apply_all 不会因为内层取锁而卡死"""
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        accs = []
+        for i in (1, 2):
+            acc = {"alias": "a{}".format(i), "uid": "uid-{}".format(i)}
+            d = ms.memory_dir(root, acc["uid"])
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "MEMORY.md"), "w", encoding="utf-8") as f:
+                f.write("# 记忆\n- 必须遵守准则 {}\n".format(i))
+            accs.append(acc)
+        ms.collect(accs, root=root)
+        results = ms.apply_all(accs, root=root)
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(r["ok"] for r in results))
 
 
 class TestMemoryHubCli(unittest.TestCase):

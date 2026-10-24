@@ -16,6 +16,7 @@
 不参与汇总，避免人格互相污染。
 """
 
+import contextlib
 import difflib
 import hashlib
 import json
@@ -41,6 +42,15 @@ SIMILARITY_THRESHOLD = 0.90
 MAX_SUPERSEDED = 5
 
 BACKUP_KEEP = 10
+
+# 发布预算：共享段落要在 4000 字窗口里生存，必须给原文留位置。
+# 分诊后原文约 3200 字，4000-3200≈800，正好是共享段落的可用额度。
+PUBLISH_BUDGET = 800
+
+# 只发布 P0（红线）/ P1（显式指令）/ P2（项目约定）。
+# P3（习惯）/ P4（推断/事实）不跨账号——"发布规则，不发布事实"。
+PUBLISH_MAX_LEVEL = 2
+MAX_PUBLISH_ENTRIES = 20
 
 BEGIN_MARK = "<!-- shared-memory:begin -->"
 END_MARK = "<!-- shared-memory:end -->"
@@ -87,6 +97,82 @@ def _safe(name):
 
 def now_iso():
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+# ----------------------------------------------------------------------------
+# 跨进程锁
+# ----------------------------------------------------------------------------
+# 切号脚本与手动 CLI 可能同时跑 collect/apply：两个进程各读各写，后写的覆盖先写的。
+# 文件内容不会写坏（原子写），但一次同步会白做。锁只保护"读-改-写"这一段。
+class MemoryLockTimeout(RuntimeError):
+    pass
+
+
+_lock_state = {}
+
+
+def _lock_file(fd):
+    """非阻塞加锁；拿不到抛 OSError。"""
+    if os.name == "nt":
+        import msvcrt
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_file(fd):
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def file_lock(root=None, name="hub", timeout=5.0):
+    """可重入的进程内 + 进程间锁。
+
+    可重入是必需的：apply_all() 会逐个调用 apply_account()，外层已持锁，
+    内层若再开一个句柄去抢同一把锁，在 Windows 上会自己把自己锁死。
+    """
+    path = os.path.join(hub_dir(root), ".{}.lock".format(name))
+    state = _lock_state.get(path)
+    if state is not None:
+        state["depth"] += 1
+        try:
+            yield path
+        finally:
+            state["depth"] -= 1
+        return
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR)
+    deadline = time.time() + max(0.1, float(timeout))
+    while True:
+        try:
+            _lock_file(fd)
+            break
+        except OSError:
+            if time.time() >= deadline:
+                os.close(fd)
+                raise MemoryLockTimeout("另一个进程正在同步记忆（锁 {}）".format(path))
+            time.sleep(0.05)
+
+    _lock_state[path] = {"fd": fd, "depth": 1}
+    try:
+        yield path
+    finally:
+        _lock_state.pop(path, None)
+        _unlock_file(fd)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 # ----------------------------------------------------------------------------
@@ -250,7 +336,7 @@ def similarity(a, b):
 STRONG_WORDS = ("必须", "禁止", "不要", "默认", "一律", "始终", "永远", "只能",
                 "must", "never", "always", "required")
 HEDGE_WORDS = ("可能", "也许", "大概", "或许", "若干", "之类", "差不多", "应该是",
-               "好像是", "大概是", "看情况")
+               "好像是", "大概是", "看情况", "似乎", "看起来")
 
 
 def quality(text):
@@ -316,6 +402,96 @@ def candidate_lines(text):
         if normalize(s):
             out.append(s)
     return out
+
+
+# ----------------------------------------------------------------------------
+# 发布口径：只发布规则，不发布事实
+# ----------------------------------------------------------------------------
+# 4,000 字窗口是全账号最容易踩的坑：把 99 条候选全塞进去，会把对方挤爆，
+# 也会把 A 号的项目细节、路径、客户名搬到 B 号——那不是共享，是污染。
+# 所以发布前先分级，只让"跨项目仍然成立的规则"过线。
+REDLINE_WORDS = ("密钥", "秘钥", "token", "密码", "凭证", "隐私", "客户信息",
+                 "身份证", "银行卡", "apikey", "api key")
+EXPLICIT_WORDS = ("必须", "禁止", "不要", "不得", "一律", "始终", "永远", "只能",
+                  "务必", "以后都", "叫我", "称呼", "默认用", "never", "must", "always")
+PROJECT_WORDS = ("提交", "测试", "分支", "命名", "格式", "流程", "步骤", "目录",
+                 "仓库", "合并", "推送", "审查", "构建", "部署")
+HABIT_WORDS = ("偏好", "喜欢", "倾向", "简洁", "详细", "语气", "中文", "英文", "回复风格")
+
+# 出现这些就说明是"某台机器上的事"，不是跨账号通用的规则
+_LOCAL_FACT_PAT = re.compile(
+    r"[A-Za-z]:[\\/]|/Users/|/home/|\\\\|https?://"
+    r"|[\w.+-]+@[\w-]+\.[\w.]+"
+    r"|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE)
+
+
+def publish_level(text):
+    """0 红线 / 1 显式指令 / 2 项目约定 / 3 习惯 / 4 事实或推断。
+
+    分级只用于"能不能跨账号发布"，不参与账号内择优——账号自己的记忆
+    哪怕只是一条路径，也该留在自己的文件里。
+    """
+    raw = str(text or "").strip()
+    low = raw.lower()
+    if not normalize(raw):
+        return 4
+    if any(w in raw for w in HEDGE_WORDS):
+        return 4
+    if any(w in low for w in REDLINE_WORDS) and any(
+            w in raw for w in ("禁止", "不要", "不得", "不能", "绝不", "must not")):
+        return 0
+    if any(w in raw for w in EXPLICIT_WORDS):
+        return 1
+    if any(w in raw for w in PROJECT_WORDS):
+        return 2
+    if any(w in raw for w in HABIT_WORDS):
+        return 3
+    return 4
+
+
+def is_local_fact(text):
+    return bool(_LOCAL_FACT_PAT.search(str(text or "")))
+
+
+def publishable(entries, budget=PUBLISH_BUDGET, max_level=PUBLISH_MAX_LEVEL,
+                limit=MAX_PUBLISH_ENTRIES):
+    """挑出可跨账号发布的条目，返回 (选中, 统计)。
+
+    排序先按级别、再按质量：一条 P0 红线永远排在一条 P4 推断前面，
+    即使后者措辞更漂亮。预算按字符算（含列表符），先到先得，装不下就停。
+    """
+    ordered = sorted(entries or [],
+                     key=lambda e: (publish_level(e.get("text", "")),
+                                    -float(e.get("quality", 0) or 0)))
+    picked = []
+    skipped = {"level": 0, "local_fact": 0, "budget": 0, "empty": 0, "conflict": 0}
+    used = 0
+    for entry in ordered:
+        text = str(entry.get("text") or "").strip()
+        if not text:
+            skipped["empty"] += 1
+            continue
+        if entry.get("suppressed"):
+            # 与另一条规则互相否定，且优先级落败：保留在库里备查，但不注入
+            skipped["conflict"] += 1
+            continue
+        # 先判"是不是本机事实"：这个理由比"级别不够"更具体，
+        # 一条带 D:/ 路径的规则被拦下时，用户需要看到的是"含本机路径"而不是"级别低"
+        if is_local_fact(text):
+            skipped["local_fact"] += 1
+            continue
+        if publish_level(text) > max_level:
+            skipped["level"] += 1
+            continue
+        cost = len(text) + 3
+        if used + cost > budget or len(picked) >= limit:
+            skipped["budget"] += 1
+            continue
+        picked.append(entry)
+        used += cost
+    skipped["used"] = used
+    return picked, skipped
 
 
 def absorb(baseline_text, current_text):
@@ -498,6 +674,11 @@ def rebalance_account(acc, root=None, target=3200, apply=False):
     这样即使中途失败，MEMORY 原文仍在，最坏情况是多了两段可清理的内容。
     """
     root = root or default_root()
+    with file_lock(root):
+        return _rebalance_locked(acc, root, target, apply)
+
+
+def _rebalance_locked(acc, root, target, apply):
     uid = str(acc.get("uid") or "").strip()
     d = memory_dir(root, uid, acc.get("enterprise_id"))
     result = {"ok": False, "alias": acc.get("alias") or uid, "apply": bool(apply),
@@ -567,7 +748,7 @@ def rebalance_account(acc, root=None, target=3200, apply=False):
 # 共享库
 # ----------------------------------------------------------------------------
 def empty_library():
-    return {"version": LIBRARY_VERSION, "updated_at": None, "entries": []}
+    return {"version": LIBRARY_VERSION, "updated_at": None, "entries": [], "tombstones": []}
 
 
 def load_library(root=None):
@@ -579,9 +760,11 @@ def load_library(root=None):
     if not isinstance(raw, dict):
         return empty_library()
     entries = raw.get("entries")
+    stones = raw.get("tombstones")
     lib = empty_library()
     lib["updated_at"] = raw.get("updated_at")
     lib["entries"] = entries if isinstance(entries, list) else []
+    lib["tombstones"] = stones if isinstance(stones, list) else []
     return lib
 
 
@@ -592,6 +775,84 @@ def save_library(lib, root=None):
 
 def _entry_id(norm):
     return hashlib.sha1(norm.encode("utf-8")).hexdigest()[:12]
+
+
+def tombstone_norms(lib):
+    return {t.get("norm") for t in (lib or {}).get("tombstones") or [] if t.get("norm")}
+
+
+def active_entries(lib):
+    """库里真正还活着的条目（排除被 forget 掉的）。"""
+    dead = tombstone_norms(lib)
+    out = []
+    for e in (lib or {}).get("entries") or []:
+        norm = e.get("norm") or normalize(e.get("text", ""))
+        if norm and norm in dead:
+            continue
+        out.append(e)
+    return out
+
+
+def forget(keyword, root=None, apply=False):
+    """按关键词/条目 id 把条目从库里摘掉，并留墓碑防复活。
+
+    只动共享库，不动账号文件：账号自己的原文属于用户，工具不替人删记忆。
+    下次 apply 重建共享段落时，这几条自然消失。
+    """
+    key = str(keyword or "").strip()
+    result = {"ok": False, "keyword": key, "matched": [], "applied": False}
+    if not key:
+        result["reason"] = "关键词为空"
+        return result
+    norm_key = normalize(key)
+    with file_lock(root):
+        lib = load_library(root)
+        matched = []
+        for e in lib.get("entries") or []:
+            text = str(e.get("text") or "")
+            if key == e.get("id") or key in text or (norm_key and norm_key in (e.get("norm") or "")):
+                matched.append(e)
+        result["matched"] = [{"id": e.get("id"), "text": e.get("text")} for e in matched]
+        if not apply or not matched:
+            result["ok"] = True
+            result["applied"] = False
+            return result
+
+        dead = tombstone_norms(lib)
+        stones = lib.setdefault("tombstones", [])
+        for e in matched:
+            norm = e.get("norm") or normalize(e.get("text", ""))
+            if norm and norm not in dead:
+                stones.append({"norm": norm, "text": e.get("text"),
+                               "id": e.get("id"), "at": now_iso()})
+                dead.add(norm)
+        ids = {e.get("id") for e in matched}
+        lib["entries"] = [e for e in lib.get("entries") or [] if e.get("id") not in ids]
+        save_library(lib, root)
+        result["ok"] = True
+        result["applied"] = True
+        result["tombstones"] = len(stones)
+        return result
+
+
+_negated_pattern = re.compile(r"不要|禁止|不得|不能|绝不|别再|never|must\s+not|don'?t", re.IGNORECASE)
+_polarity_strip = re.compile(
+    r"不要|禁止|不得|不能|绝不|别再|不许|必须|务必|一律|只能|always|never|must|don'?t|别",
+    re.IGNORECASE)
+
+
+def is_negated(text):
+    """一条记忆是不是"否定式约束"。用于发现两个账号互相打架的规则。"""
+    return bool(_negated_pattern.search(str(text or "")))
+
+
+def polarity_form(text):
+    """抹掉肯定/否定与强度词后的形式。
+
+    两条规则如果只差一个"不要"，字面相似度会被这个差异拉低到 0.7 以下，
+    永远进不了同一个相似簇——所以冲突检测必须先把极性抹平再比。
+    """
+    return _polarity_strip.sub("", normalize(text))
 
 
 def _cluster(items):
@@ -621,19 +882,65 @@ def _cluster(items):
     return list(groups.values())
 
 
+def _mark_conflicts(entries):
+    """找出"只差一个否定词"的两条规则，标记落败方为不注入。
+
+    为什么不在聚类里做：负号差异会把字面相似度压到 0.9 以下，两条根本进不了
+    同一个簇。所以这里用"抹掉极性后的形式"重新分桶，再按级别+质量选唯一注入版本。
+    落败方不删除——它可能才是用户真正想要的，只是暂时排在后面。
+    """
+    buckets = {}
+    for e in entries:
+        form = polarity_form(e.get("text", ""))
+        if form:
+            buckets.setdefault(form, []).append(e)
+
+    count = 0
+    for form, group in buckets.items():
+        if len(group) < 2:
+            continue
+        if not any(is_negated(e.get("text", "")) for e in group):
+            continue
+        ordered = sorted(group, key=lambda e: (publish_level(e.get("text", "")),
+                                               -len(e.get("sources") or []),
+                                               -float(e.get("quality") or 0),
+                                               e.get("text") or ""))
+        winner = ordered[0]
+        for loser in ordered[1:]:
+            loser["suppressed"] = True
+            loser["conflict_of"] = winner.get("id")
+            winner.setdefault("conflicts", []).append({
+                "id": loser.get("id"),
+                "text": loser.get("text"),
+                "sources": loser.get("sources") or [],
+                "reason": "否定差异（只保留优先级更高的一条参与注入）",
+            })
+            count += 1
+    for e in entries:
+        e.setdefault("conflicts", [])
+    return count
+
+
 def collect(accounts, root=None):
     """扫描所有账号的 MEMORY.md，汇总去重后写库。
 
     accounts: [{"alias","uid","enterprise_id"}]
-    返回 {ok, accounts, raw_entries, entries, merged, superseded}
+    返回 {ok, accounts, raw_entries, entries, merged, superseded, conflicts, forgotten}
     """
     root = root or default_root()
+    with file_lock(root):
+        return _collect_locked(accounts, root)
+
+
+def _collect_locked(accounts, root):
     old = load_library(root)
     old_by_id = {e.get("id"): e for e in old.get("entries") or []}
+    dead = tombstone_norms(old)
 
     items = []
     per_account = {}
     skipped = []
+    forgotten = 0
     for acc in accounts or []:
         uid = str(acc.get("uid") or "").strip()
         path = memory_file(root, uid, acc.get("enterprise_id"))
@@ -650,6 +957,10 @@ def collect(accounts, root=None):
         per_account[alias] = len(lines)
         for line in lines:
             norm = normalize(line)
+            if norm in dead:
+                # forget 过的条目不能因为账号文件里还在就被收回来
+                forgotten += 1
+                continue
             score, _ = quality(line)
             items.append({
                 "text": line.strip(),
@@ -661,6 +972,7 @@ def collect(accounts, root=None):
 
     merged = 0
     superseded_count = 0
+    conflict_count = 0
     entries = []
     for group in _cluster(items) if items else []:
         versions = [items[i] for i in group]
@@ -688,16 +1000,20 @@ def collect(accounts, root=None):
             "sources": sorted({v["uid"] for v in versions if v["uid"]}),
             "aliases": sorted({v["alias"] for v in versions if v["alias"]}),
             "superseded": (prev.get("superseded") or []) + losers,
+            "conflicts": [],
             "first_seen": prev.get("first_seen") or now_iso(),
             "last_seen": now_iso(),
         })
+
+    conflict_count = _mark_conflicts(entries)
 
     for e in entries:
         if len(e["superseded"]) > MAX_SUPERSEDED:
             e["superseded"] = e["superseded"][:MAX_SUPERSEDED]
 
     entries.sort(key=lambda e: (-e["quality"], e["text"]))
-    lib = {"version": LIBRARY_VERSION, "updated_at": now_iso(), "entries": entries}
+    lib = {"version": LIBRARY_VERSION, "updated_at": now_iso(), "entries": entries,
+           "tombstones": old.get("tombstones") or []}
     save_library(lib, root)
     return {
         "ok": True,
@@ -707,6 +1023,8 @@ def collect(accounts, root=None):
         "entries": len(entries),
         "merged": merged,
         "superseded": superseded_count,
+        "conflicts": conflict_count,
+        "forgotten": forgotten,
     }
 
 
@@ -720,19 +1038,25 @@ def _ensure_snapshot(root, uid, memory_path, current_text=None):
     return current
 
 
-def apply_account(acc, root=None, lib=None):
+def apply_account(acc, root=None, lib=None, budget=PUBLISH_BUDGET,
+                  max_level=PUBLISH_MAX_LEVEL):
     """把一个账号的 MEMORY.md 渲染成「基线原文 + 共享段落」。
 
-    返回 {ok, alias, action, shared, truncated, added, upgraded, backup}
+    返回 {ok, alias, action, shared, truncated, added, upgraded, backup, skipped}
     action: created | updated | unchanged | no_memory_file | error
     """
     root = root or default_root()
+    with file_lock(root):
+        return _apply_locked(acc, root, lib, budget, max_level)
+
+
+def _apply_locked(acc, root, lib, budget, max_level):
     lib = lib or load_library(root)
     uid = str(acc.get("uid") or "").strip()
     alias = acc.get("alias") or uid
     path = memory_file(root, uid, acc.get("enterprise_id"))
     result = {"ok": False, "alias": alias, "action": "error", "shared": 0,
-              "truncated": 0, "added": 0, "upgraded": 0, "backup": None}
+              "truncated": 0, "added": 0, "upgraded": 0, "backup": None, "skipped": {}}
     if not path:
         result["action"] = "no_memory_file"
         return result
@@ -756,8 +1080,8 @@ def apply_account(acc, root=None, lib=None):
     result["upgraded"] = upgraded
 
     own_norms = [normalize(l) for l in candidate_lines(new_baseline)]
-    shared = []
-    for entry in sorted(lib.get("entries") or [], key=lambda e: -e.get("quality", 0)):
+    candidates = []
+    for entry in active_entries(lib):
         norm = entry.get("norm") or normalize(entry.get("text", ""))
         if not norm:
             continue
@@ -765,8 +1089,10 @@ def apply_account(acc, root=None, lib=None):
             continue
         if any(similarity(norm, n) >= SIMILARITY_THRESHOLD for n in own_norms):
             continue
-        shared.append(entry)
+        candidates.append(entry)
 
+    shared, skipped = publishable(candidates, budget=budget, max_level=max_level)
+    result["skipped"] = skipped
     rendered, written, truncated = render(new_baseline, shared)
     result["shared"] = written
     result["truncated"] = truncated
@@ -789,14 +1115,21 @@ def apply_account(acc, root=None, lib=None):
     return result
 
 
-def apply_all(accounts, root=None):
-    lib = load_library(root)
-    return [apply_account(a, root=root, lib=lib) for a in accounts or []]
+def apply_all(accounts, root=None, budget=PUBLISH_BUDGET, max_level=PUBLISH_MAX_LEVEL):
+    with file_lock(root):
+        lib = load_library(root)
+        return [apply_account(a, root=root, lib=lib, budget=budget, max_level=max_level)
+                for a in accounts or []]
 
 
 def restore_account(acc, root=None):
     """把基线快照原样写回账号文件；写回前备份当前文件。"""
     root = root or default_root()
+    with file_lock(root):
+        return _restore_locked(acc, root)
+
+
+def _restore_locked(acc, root):
     uid = str(acc.get("uid") or "").strip()
     path = memory_file(root, uid, acc.get("enterprise_id"))
     snap = snapshot_path(root, uid)
@@ -817,6 +1150,8 @@ def restore_account(acc, root=None):
 def status(accounts, root=None):
     root = root or default_root()
     lib = load_library(root)
+    live = active_entries(lib)
+    picked, pub_stats = publishable(live)
     rows = []
     for acc in accounts or []:
         uid = str(acc.get("uid") or "").strip()
@@ -837,8 +1172,15 @@ def status(accounts, root=None):
             "shared_entries": shared_lines,
             "total_chars": len(current.strip()),
             "over_limit": len(current.strip()) > INJECT_LIMIT,
+            "headroom": max(0, INJECT_LIMIT - len(own.strip())),
         })
     return {"library": {"entries": len(lib.get("entries") or []),
+                        "live": len(live),
+                        "publishable": len(picked),
+                        "publish_chars": pub_stats["used"],
+                        "budget": PUBLISH_BUDGET,
+                        "conflicts": sum(1 for e in live if e.get("conflicts")),
+                        "tombstones": len(lib.get("tombstones") or []),
                         "updated_at": lib.get("updated_at"),
                         "path": library_path(root)},
             "accounts": rows}

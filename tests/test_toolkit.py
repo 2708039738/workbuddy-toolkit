@@ -2282,6 +2282,51 @@ class TestWorkBuddyCore(unittest.TestCase):
         manifest = os.path.join(bundle, "manifest.json")
         self.assertEqual(stat.S_IMODE(os.stat(manifest).st_mode), 0o600)
 
+    @unittest.skipUnless(sys.platform == "win32", "junction 仅 Windows")
+    def test_t83_cross_volume_nested_junction_is_rejected(self):
+        """T83: 跨卷复制遇到目录内嵌 junction 必须拒绝，不能把目标内容拷走"""
+        import errno
+        import io
+
+        path = self._write_profile("xv", "uid-xv", "XV")
+        root = os.path.dirname(workbuddy.PROFILES_DIR)
+        profile_dir = os.path.join(root, "user-uid-xv-personal")
+        os.makedirs(profile_dir)
+        with open(os.path.join(profile_dir, "MEMORY.md"), "w", encoding="utf-8") as f:
+            f.write("mem")
+        target = os.path.join(root, "xv-target")
+        os.makedirs(target)
+        marker = os.path.join(target, "KEEP.txt")
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write("keep")
+        link = os.path.join(profile_dir, "nested")
+        if subprocess.run(["cmd", "/c", "mklink", "/J", link, target],
+                          capture_output=True).returncode != 0:
+            self.skipTest("当前环境无法创建 junction")
+
+        real_replace = os.replace
+
+        def exdev(src, dst):
+            s = os.path.abspath(str(src))
+            t = os.path.abspath(str(dst))
+            if "auth_profiles_trash" in t and "auth_profiles_trash" not in s:
+                raise OSError(errno.EXDEV, "simulated cross-device")
+            return real_replace(src, dst)
+
+        try:
+            with patch.object(workbuddy.os, "replace", side_effect=exdev):
+                with patch("sys.stdout", io.StringIO()):
+                    res = workbuddy.remove_profile("xv", yes=True, purge_memory=True)
+        finally:
+            if os.path.exists(profile_dir):
+                workbuddy._remove_tree(profile_dir)
+
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["action"], "error")
+        self.assertTrue(res.get("credential_restored"))
+        self.assertTrue(os.path.exists(path), "凭证应回滚到原路径")
+        self.assertTrue(os.path.exists(marker), "junction 目标内容被复制或删除")
+
 if __name__ == "__main__":
     unittest.main()
 

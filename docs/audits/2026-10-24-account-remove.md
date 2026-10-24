@@ -608,7 +608,7 @@ Windows 单平台验证；符号链接与 POSIX 权限位未验证；无真实�
 | R5 | **P2** | 同名 stem 的旧记忆归档还在时，新凭证备份复用同名，`exist_ok=True` 可能把两份档案混进同一 bundle | 固定时间戳 + 预置 `memory/<stem>/`，旧实现返回同名 `.info` | `_reserve_trash_path` 跳过已存在的记忆 stem；新增 T81（旧实现 FAIL） |
 | R6 | **P2** | 明文人格/记忆归档目录权限随 umask，POSIX 下可能被同机其他用户遍历 | 代码审查；Windows 无法验证 POSIX 位 | bundle/files 目录 `0700`，清单 `0600`；新增 T82（Windows skip） |
 | R7 | P3 | 符号链接/junction 被静默跳过，用户以为已清干净 | 发现阶段直接 `continue`，无输出 | `get_account_reparse_points` 列出并在输出/JSON 里标注"未处理" |
-| R8 | P3 | 跨卷 `copytree` 会把目录内嵌的 junction 当普通目录递归复制，把目标内容拷进回收站 | 代码审查；本机无第二块卷，未造真实跨卷 | `_tree_has_reparse` 在复制前扫树，有链接即拒绝跨卷移动 |
+| R8 | P3 | 跨卷 `copytree` 会把目录内嵌的 junction 当普通目录递归复制，把目标内容拷进回收站 | 构造内嵌 junction + 只让跨根 `os.replace` 抛 `EXDEV`；旧实现复制目标并删除源 | `_tree_has_reparse` 在复制前扫树，有链接即拒绝跨卷移动；新增 T83（旧实现 FAIL） |
 
 ### 16.3 已验证不成立的攻击
 
@@ -627,6 +627,8 @@ Windows 单平台验证；符号链接与 POSIX 权限位未验证；无真实�
 ### 16.4 旧实现/新实现对照
 
 把新增 T77–T81 复制到 `fca0b6d` 的干净导出目录执行：T77 FAIL、T78 ERROR、T79 ERROR、T80 FAIL、T81 FAIL；在修复后的分支上全部通过。T82 仅 POSIX，Windows skip。
+
+修复后 `git archive HEAD` 干净导出的全量结果：**242 tests / 0 failure / 1 error / 15 skipped**；唯一 error 仍是 `test_log_guard` 调 `schtasks.exe` 被本机沙箱拦截（与改动无关）。另在独立 worktree `wb-adv-e`（同一 commit）复跑了回滚、junction、CLI、规模与跨卷探针。
 
 ### 16.5 仍未验证
 

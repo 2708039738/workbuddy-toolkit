@@ -108,8 +108,8 @@ workbuddy memory on
 
 开启后切号时会自动汇总并渲染；也可以手动执行 `workbuddy memory collect` + `workbuddy memory apply` 先看效果。
 
-它不会覆盖你的原文：账号 `MEMORY.md` 会被保存成基线快照，共享内容只追加在文件末尾的受管段落里。
-疑似重复的条目只保留质量更高的一条，落选版本留档。想还原：
+它不会覆盖你的原文：日常渲染是“你文件里现在的内容 + 追加段落”，原文逐字保留在开头；首次接入时会另存一份快照，只给 `restore` 用。
+疑似重复的条目只保留质量更高的一条，落选版本留档。想还原（同时摘掉分诊写入 SOUL / USER 的段落）：
 
 ```bash
 workbuddy memory restore <账号>

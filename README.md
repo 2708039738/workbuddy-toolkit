@@ -169,18 +169,22 @@ wb-audit      检查账号健康度
 
 ```text
 workbuddy memory collect        汇总所有账号 MEMORY.md，去重择优入库
+workbuddy memory compact        给超长/偏好事实类条目建分片，窗口里只留一行索引
 workbuddy memory apply [账号]   渲染进指定账号（省略则全部）
-workbuddy memory rebalance      把准则/画像分流到 SOUL、USER（默认只出计划）
+workbuddy memory rebalance      把准则/画像按节分流到 SOUL、USER（默认只出计划）
 workbuddy memory forget <关键词>  移出共享库并留墓碑，不再复活（默认只预览）
 workbuddy memory conflicts      查看互相否定的规则
 workbuddy memory status         库规模、可发布条数、各账号字数
-workbuddy memory restore <账号>  用基线快照还原（还原前自动备份）
+workbuddy memory restore <账号>  用快照还原（同时摘掉分诊写入的 SOUL / USER 段落）
 workbuddy memory on / off       开启 / 关闭切号时自动汇总渲染
 ```
 
-- **`--budget N`**：共享段落自身的字数预算，默认 800。每条按“正文 + 3”计，最多 20 条，先到先得；给账号原文留出 4,000 字窗口里的位置，不是文件总长度。
-- **为什么只发布规则不发布事实**：客户端只注入 `MEMORY.md` 前 4,000 字，事实类条目又长又多，放行就会挤掉别人的原文；况且路径、客户名、内部 URL 这类本机事实跨账号带过去只会造成污染。默认只发布红线、显式指令、项目约定（P0–P2），含本机路径 / 邮箱 / URL / UUID 的条目一律不跨账号。
-- **可回滚**：目录在 `~/.workbuddy/cache/shared_memory/`，快照 `originals/<uid>/`、备份 `backups/<账号目录>/`（保留最近 10 份）。
+- **`--budget N`**：共享段落自身的字数预算，默认 800。每条按“正文 + 3”计，最多 20 条，先到先得；给账号原文留出 4,000 字窗口里的位置，不是文件总长度。渲染按最终整篇长度校验，原文优先，原文自己就顶满 4,000 时不会再补换行。
+- **`apply` 的基线是“文件当前的自有内容”**：你在 `MEMORY.md` 里删掉一条，下次 `apply` 不会把它写回来；只有 `restore` 才回到快照。
+- **分诊按节搬**：文档有 ≥2 个 `##` 标题时整节迁移（标题、列表、缩进子项一起走），散条目文档才逐行搬；CLI 逐节打印“留下 / 搬走”。实测一个 5,953 字的记忆分诊到 2,542 字，同账号 SOUL 从 1,792 字增到 5,253 字。
+- **为什么只发布规则不发布事实**：客户端只注入 `MEMORY.md` 前 4,000 字，事实类条目又长又多，放行就会挤掉别人的原文；况且路径、客户名、内部 URL 这类本机事实跨账号带过去只会造成污染。默认只发布红线、显式指令、项目约定（P0–P2），含本机路径 / 邮箱 / URL / UUID 的条目、以及以 `>` / `*` / `_` / `|` 开头的文档碎片一律不跨账号。
+- **长规则落分片**：`compact` 把超长或偏好/事实类条目的原文写到 `cache/shared_memory/shards/<id>.md`，`apply` 只在窗口剩余预算里补最多 8 行索引（`- [P1] … → shards/…`）。分片正文不会被注入，它是“规则别丢”的存放处。
+- **可回滚**：目录在 `~/.workbuddy/cache/shared_memory/`，快照 `originals/<uid>/`、备份 `backups/<账号目录>/`（保留最近 10 份）。`restore` 会连 SOUL / USER 里由分诊写入的受管段落一起摘掉，等于回到分诊前。
 
 完整用法、失效场景与回滚步骤见 [跨账号记忆共享](docs/memory-sharing.md)，能力边界见 [功能参考](docs/feature-reference.md#跨账号记忆汇总--workbuddy-memory)。
 

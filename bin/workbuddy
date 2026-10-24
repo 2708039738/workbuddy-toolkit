@@ -773,12 +773,18 @@ def get_display_nickname(account_data, default_name=""):
 
     uin = account_data.get("uin")
     if uin not in (None, ""):
-        return str(uin).strip()
+        clean_uin = str(uin).strip()
+        # uin / uid 是兜底展示值，同样要过控制字符校验，
+        # 否则被改坏的凭证文件可以把 ANSI 转义序列打进终端输出（伪造提示行）。
+        if is_valid_nickname_string(clean_uin):
+            return clean_uin
 
     uid = account_data.get("uid")
     if uid not in (None, ""):
         clean_uid = str(uid).strip()
-        return clean_uid[:8] if len(clean_uid) >= 8 else clean_uid
+        short_uid = clean_uid[:8] if len(clean_uid) >= 8 else clean_uid
+        if is_valid_nickname_string(short_uid):
+            return short_uid
 
     return str(default_name) if default_name else "未知用户"
 
@@ -2342,6 +2348,137 @@ def get_profiles_trash_dir():
     """
     return os.path.join(os.path.dirname(os.path.abspath(PROFILES_DIR)), "auth_profiles_trash")
 
+def _reserve_trash_path(trash_dir, alias):
+    """用 O_CREAT|O_EXCL 独占创建回收站文件名，返回已占位的路径。
+
+    先 exists() 再 move 是典型 TOCTOU：两个进程同一秒删同一别名时都能通过检查，
+    后一个 shutil.move 会把前一份备份覆盖掉。软删除静默失效是本功能最不能出的错。
+    """
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for seq in range(1000):
+        name = f"{alias}-{stamp}.info" if seq == 0 else f"{alias}-{stamp}-{seq}.info"
+        candidate = os.path.join(trash_dir, name)
+        try:
+            fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            continue
+        os.close(fd)
+        return candidate
+    raise OSError("回收站文件名冲突过多，请稍后重试")
+
+def _trash_items():
+    """列出回收站里的备份（只认 *.info 文件）。"""
+    d = get_profiles_trash_dir()
+    items = []
+    if os.path.isdir(d):
+        for name in sorted(os.listdir(d)):
+            p = os.path.join(d, name)
+            if not name.endswith(".info") or not os.path.isfile(p):
+                continue
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            items.append({"name": name, "size": st.st_size,
+                          "mtime": format_timestamp(st.st_mtime * 1000)})
+    return d, items
+
+def list_trash_cmd(as_json=False):
+    """`workbuddy remove --list-trash`：回收站无 GUI 入口，至少要能列出来。"""
+    d, items = _trash_items()
+    if as_json:
+        print(json.dumps({"dir": d, "count": len(items), "items": items},
+                         ensure_ascii=False, indent=2))
+        return 0
+    if not items:
+        print(f"{COLOR_CYAN}回收站为空: {d}{COLOR_RESET}")
+        return 0
+    print(f"{COLOR_BOLD}回收站 {d}（{len(items)} 个备份）{COLOR_RESET}")
+    for i, it in enumerate(items, 1):
+        size = it["size"]
+        human = f"{size} B" if size < 1024 else f"{size / 1024:.1f} KB"
+        print(f"  [{i}] {it['name']:<44} {human:>9}  {it['mtime']}")
+    print(f"  还原: {COLOR_BOLD}workbuddy remove --restore <文件名>{COLOR_RESET}")
+    return 0
+
+_TRASH_NAME_RE = re.compile(r"^(?P<alias>.+?)-\d{8}-\d{6}(?:-\d+)?\.info$")
+
+def _alias_from_trash_name(name):
+    m = _TRASH_NAME_RE.match(name)
+    return m.group("alias") if m else name[:-5]
+
+def restore_from_trash(name, yes=False, force=False, as_json=False):
+    """把回收站里的备份还原成账号配置。返回结构化结果。
+
+    只接受回收站目录内的文件名，拒绝路径成分，避免 `--restore ../../x` 之类越界。
+    """
+    result = {"ok": False, "action": "not_found", "alias": None,
+              "from": None, "to": None, "message": ""}
+
+    def _finish(message, lines=None):
+        result["message"] = message
+        if as_json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            for line in (lines or [message]):
+                print(line)
+        return result
+
+    raw_name = str(name or "").strip()
+    clean = os.path.basename(raw_name)
+    if not clean or clean != raw_name or clean in (".", ".."):
+        return _finish("只接受回收站里的文件名，不能带路径",
+                       [f"{COLOR_RED}错误: 只接受回收站里的文件名，不能带路径{COLOR_RESET}"])
+
+    trash_dir = get_profiles_trash_dir()
+    src = os.path.join(trash_dir, clean)
+    if not os.path.isfile(src):
+        return _finish(f"回收站里没有 {clean}",
+                       [f"{COLOR_RED}回收站里没有 {clean}{COLOR_RESET}"])
+
+    alias = re.sub(r"[^\w\-]", "_", _alias_from_trash_name(clean)).strip("_") or "account_restored"
+    dest = os.path.join(PROFILES_DIR, f"{alias}.info")
+    result.update({"alias": alias, "from": src, "to": dest})
+
+    if os.path.exists(dest) and not force:
+        result["action"] = "refused_exists"
+        return _finish(
+            f"'{alias}' 已存在，恢复会覆盖当前配置",
+            [f"{COLOR_RED}▲ 已存在 {dest}{COLOR_RESET}",
+             f"  恢复会覆盖这份配置；确认覆盖请加 {COLOR_BOLD}--force{COLOR_RESET}。"],
+        )
+
+    if not yes:
+        if not sys.stdin.isatty():
+            result["action"] = "refused_non_interactive"
+            return _finish("非交互式环境需要 --yes 才能恢复",
+                           [f"{COLOR_RED}非交互式环境，已阻止恢复。{COLOR_RESET}",
+                            f"  确认请加 {COLOR_BOLD}--yes{COLOR_RESET}。"])
+        try:
+            ans = input(f"{COLOR_YELLOW}把 {clean} 还原为 '{alias}'？[y/N]: {COLOR_RESET}").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            ans = ""
+        if ans not in ("y", "yes"):
+            result["action"] = "cancelled"
+            return _finish("已取消恢复", ["已取消恢复。"])
+
+    try:
+        os.makedirs(PROFILES_DIR, exist_ok=True)
+        try:
+            os.replace(src, dest)
+        except OSError:
+            shutil.move(src, dest)
+    except OSError as e:
+        result["action"] = "error"
+        return _finish(f"恢复失败: {e}", [f"{COLOR_RED}恢复失败: {e}{COLOR_RESET}"])
+
+    result["ok"] = True
+    result["action"] = "restored"
+    return _finish(
+        f"已还原账号 '{alias}'",
+        [f"{COLOR_GREEN}✔ 已还原账号 '{alias}' -> {dest}{COLOR_RESET}"],
+    )
+
 def remove_profile(target_name, yes=False, force=False, purge=False, as_json=False, quiet=False):
     """删除本地已保存的账号凭证（Profile），默认移入回收站而非直接抹除。
 
@@ -2363,6 +2500,7 @@ def remove_profile(target_name, yes=False, force=False, purge=False, as_json=Fal
         "nickname": None,
         "action": "not_found",
         "was_active": False,
+        "active_unknown": False,
         "unparsable": False,
         "trash_path": None,
         "message": "",
@@ -2384,15 +2522,20 @@ def remove_profile(target_name, yes=False, force=False, purge=False, as_json=Fal
     available = ", ".join(sorted(profiles.keys())) or "(无)"
     unparsable = False
     if not target:
-        # 兜底：半截 JSON / 非 UTF-8 的凭证会被 get_profiles() 静默跳过，
-        # 但它仍然占着 auth_profiles/<别名>.info。不允许按文件名清理，
-        # 这类账号就永久删不掉了（重新扫码只是覆盖，不是删除）。
-        raw_alias = re.sub(r"[^\w\-]", "_", str(target_name or "")).strip("_")
-        raw_path = os.path.join(PROFILES_DIR, f"{raw_alias}.info")
-        if raw_alias and os.path.isfile(raw_path):
-            alias = raw_alias
-            target = {"path": raw_path, "uid": "", "nickname": f"{raw_alias}（凭证文件无法解析）"}
-            unparsable = True
+        # 兜底：半截 JSON / 非 UTF-8 的凭证会被 get_profiles() 静默跳过，永远删不掉。
+        # 只接受"原样就是一个合法别名"的输入：一旦做清洗，'../../alpha' 会塌成 'alpha'，
+        # 等于替用户点了另一个账号的名，还会绕过下面的 uid 比对与活跃保护。
+        raw = str(target_name or "").strip()
+        if re.fullmatch(r"[\w\-]{1,64}", raw):
+            raw_path = os.path.join(PROFILES_DIR, f"{raw}.info")
+            if os.path.isfile(raw_path):
+                try:
+                    with open(raw_path, "r", encoding="utf-8") as f:
+                        json.load(f)  # 能解析就不是"损坏文件"，不该走兜底
+                except (OSError, ValueError, UnicodeDecodeError):
+                    alias = raw
+                    target = {"path": raw_path, "uid": "", "nickname": f"{raw}（凭证文件无法解析）"}
+                    unparsable = True
     if not target:
         return _finish(
             f"未找到唯一匹配 '{target_name}' 的已保存账号。可用账号: {available}",
@@ -2408,11 +2551,31 @@ def remove_profile(target_name, yes=False, force=False, purge=False, as_json=Fal
     result["nickname"] = nickname
     result["unparsable"] = unparsable
 
+    # 身份未知（文件都解析不出来）就不能当作普通账号处理：
+    # 它可能正是当前活跃账号的备份，而这里没有任何 uid 可比对。
+    if unparsable and not force:
+        result["action"] = "refused_unparsable"
+        return _finish(
+            f"'{alias}' 的凭证文件无法解析，身份未知，默认不删",
+            [f"{COLOR_RED}▲ '{alias}' 的凭证文件无法解析，无法校验它属于哪个账号。{COLOR_RESET}",
+             "  这类文件不会被 wb-list 收录，但可能正是某个账号（含当前账号）的备份。",
+             f"  确认要清理请显式加 {COLOR_BOLD}--force{COLOR_RESET}。"],
+        )
+
     active_data = get_active_account()
     active_acc = active_data.get("account") if isinstance(active_data, dict) else None
     active_uid = str(active_acc.get("uid") or "") if isinstance(active_acc, dict) else ""
     was_active = bool(active_uid and uid and active_uid == uid)
     result["was_active"] = was_active
+    # 凭证文件存在但解析不出来（半截 JSON / 被改坏）时，无法判定"当前是谁在用"。
+    # 此时若直接放行，活跃账号保护会静默失效——用户明明正在用 A，
+    # 却能在不加 --force 的情况下删掉 A 的备份。保守处理：解析失败等价于"可能是活跃账号"。
+    # 注意：文件是合法 JSON 但缺少 account.uid 属于"已登出"的正常状态，不算不可知，
+    # 否则登出后每次删除都要 --force，反而逼用户养成习惯性加参数。
+    active_unknown = bool(
+        active_data is None and not was_active and os.path.exists(AUTH_FILE)
+    )
+    result["active_unknown"] = active_unknown
 
     if was_active and not force:
         result["action"] = "refused_active"
@@ -2421,6 +2584,16 @@ def remove_profile(target_name, yes=False, force=False, purge=False, as_json=Fal
             [f"{COLOR_RED}▲ '{alias}' ({nickname}) 是当前活跃账号。{COLOR_RESET}",
              "  WorkBuddy 客户端会保持当前登录，但本地不再有该账号的备份，切走后只能重新扫码。",
              f"  确认删除请显式加 {COLOR_BOLD}--force{COLOR_RESET}；先切到其他账号再删除更稳妥。"],
+        )
+
+    if active_unknown and not force:
+        result["action"] = "refused_active_unknown"
+        return _finish(
+            "当前活跃账号无法确认（凭证文件损坏或缺少 uid），已按保守策略拒绝删除",
+            [f"{COLOR_RED}▲ 无法确认当前活跃账号：{AUTH_FILE} 存在但读不出 uid。{COLOR_RESET}",
+             f"  为避免删掉正在使用账号的备份，已拒绝删除 '{alias}' ({nickname})。",
+             f"  可先运行 {COLOR_BOLD}workbuddy doctor{COLOR_RESET} 检查凭证；"
+             f"确认要删再加 {COLOR_BOLD}--force{COLOR_RESET}。"],
         )
 
     if not yes:
@@ -2452,15 +2625,20 @@ def remove_profile(target_name, yes=False, force=False, purge=False, as_json=Fal
         else:
             trash_dir = get_profiles_trash_dir()
             os.makedirs(trash_dir, exist_ok=True)
-            # 同一秒内删同名账号（删完又从回收站恢复再删）不能共用文件名：
-            # shutil.move 到已存在的目标会直接覆盖，前一份备份就静默丢了。
-            stamp = time.strftime("%Y%m%d-%H%M%S")
-            trash_path = os.path.join(trash_dir, f"{alias}-{stamp}.info")
-            seq = 1
-            while os.path.exists(trash_path):
-                trash_path = os.path.join(trash_dir, f"{alias}-{stamp}-{seq}.info")
-                seq += 1
-            shutil.move(src_path, trash_path)
+            # 冲突时不能靠 exists() 判断（TOCTOU），用 O_EXCL 独占占位再原子替换
+            trash_path = _reserve_trash_path(trash_dir, alias)
+            try:
+                try:
+                    os.replace(src_path, trash_path)
+                except OSError:
+                    # 跨卷等场景回退到 move；此时文件名已被独占，不会被别人覆盖
+                    shutil.move(src_path, trash_path)
+            except OSError:
+                try:
+                    os.remove(trash_path)
+                except OSError:
+                    pass
+                raise
             result["action"] = "trashed"
             result["trash_path"] = trash_path
     except OSError as e:
@@ -4310,39 +4488,102 @@ def _parse_audit_cli_args(args_list):
         i += 1
     return force, daemon_mode, interval_hours
 
-REMOVE_FLAGS = ("--yes", "-y", "--confirm", "--force", "-f", "--overwrite",
-                "--purge", "--json", "-j")
+# remove 子命令只认这些开关。`--force` 与 `-y/--yes` **不互为别名**：
+# 前者是"放宽保护"，后者是"跳过确认"；混用会让只想跳过确认的人误删活跃账号。
+REMOVE_BOOL_FLAGS = {
+    "--yes": "yes", "-y": "yes", "--confirm": "yes",
+    "--force": "force",
+    "--purge": "purge",
+    "--json": "json", "-j": "json",
+    "--list-trash": "list_trash",
+}
+
+REMOVE_USAGE = (
+    "用法:\n"
+    "  workbuddy remove <账号名|昵称|UID> [--yes] [--force] [--purge] [--json]\n"
+    "  workbuddy remove --list-trash [--json]\n"
+    "  workbuddy remove --restore <回收站文件名> [--yes] [--force] [--json]"
+)
+
+class RemoveArgsError(ValueError):
+    """remove 子命令参数非法（未知选项 / 多目标 / 缺值）。"""
 
 def _parse_remove_cli_args(args_list):
-    """解析 remove/delete 子命令参数。返回 (target, yes, force, purge, as_json)。
+    """严格解析 remove 子命令参数，返回 {mode, target, restore, yes, force, purge, json}。
 
-    只按"已知开关"剔除参数，不按 "-" 前缀剔除：
-    `wb-login "-weird"` 是能建出以 - 开头别名的，按前缀过滤会让这种账号永远删不掉。
+    破坏性命令不做"尽力而为"的解析：
+    - 未知选项直接报错，避免 `remove a --dry-run` 把 a 真删掉；
+    - 多于一个目标直接报错，避免 `remove a b` 静默只处理 a；
+    - `--` 之后一律按位置参数处理，用来支持 `-weird` 这类连字符开头的别名。
     """
-    yes_flag = any(a in ("--yes", "-y", "--confirm") for a in args_list)
-    force = any(a in ("--force", "-f", "--overwrite") for a in args_list)
-    purge = any(a in ("--purge",) for a in args_list)
-    as_json = any(a in ("--json", "-j") for a in args_list)
-    clean_args = [a for a in args_list if a not in REMOVE_FLAGS]
-    return (clean_args[0] if clean_args else None), yes_flag, force, purge, as_json
+    opts = {"yes": False, "force": False, "purge": False, "json": False, "list_trash": False}
+    restore = None
+    positionals = []
+    i = 0
+    total = len(args_list)
+    while i < total:
+        arg = str(args_list[i])
+        if arg == "--":
+            positionals.extend(str(a) for a in args_list[i + 1:])
+            break
+        if arg == "--restore":
+            if i + 1 >= total:
+                raise RemoveArgsError("--restore 需要一个回收站文件名")
+            restore = str(args_list[i + 1])
+            i += 2
+            continue
+        if arg in REMOVE_BOOL_FLAGS:
+            opts[REMOVE_BOOL_FLAGS[arg]] = True
+        elif arg.startswith("-") and arg != "-":
+            raise RemoveArgsError(f"未知选项: {arg}")
+        else:
+            positionals.append(arg)
+        i += 1
 
-REMOVE_USAGE = "用法: workbuddy remove <账号名|昵称|UID> [--yes] [--force] [--purge] [--json]"
+    if opts["list_trash"]:
+        if restore or positionals or opts["purge"]:
+            raise RemoveArgsError("--list-trash 不能与账号名 / --restore / --purge 同时使用")
+        return {"mode": "list", "target": None, "restore": None, **opts}
+    if restore:
+        if positionals or opts["purge"]:
+            raise RemoveArgsError("--restore 不能与账号名 / --purge 同时使用")
+        if "/" in restore or "\\" in restore or restore in (".", ".."):
+            raise RemoveArgsError("--restore 只接受回收站里的文件名，不能带路径")
+        return {"mode": "restore", "target": None, "restore": restore, **opts}
+    if not positionals:
+        raise RemoveArgsError("缺少要删除的账号名")
+    if len(positionals) > 1:
+        raise RemoveArgsError("一次只能处理一个账号，收到 {} 个: {}".format(
+            len(positionals), ", ".join(positionals)))
+    return {"mode": "remove", "target": positionals[0], "restore": None, **opts}
 
 def run_remove_cmd(args_list):
-    """`workbuddy remove` 子命令入口。返回退出码: 0 成功，1 未删除，2 参数缺失。"""
-    if any(a in ("-h", "--help", "help") for a in args_list):
+    """`workbuddy remove` 子命令入口。退出码: 0 成功，1 未执行，2 参数错误。"""
+    if any(a in ("-h", "--help") for a in args_list):
         print(REMOVE_USAGE)
-        print("  --yes    跳过确认（非交互式环境必须显式指定）")
-        print("  --force  允许删除当前活跃账号")
-        print("  --purge  直接永久删除，不保留回收站副本")
-        print("  --json   以 JSON 输出结果，便于脚本消费")
+        print("  -y, --yes        跳过交互确认（非交互式环境必须显式指定）")
+        print("  --force          放宽保护：删当前活跃账号 / 身份未知的损坏凭证 / 覆盖恢复目标")
+        print("  --purge          直接永久删除，不保留回收站副本")
+        print("  --list-trash     列出回收站里的备份")
+        print("  --restore <文件>  把指定备份还原为账号配置")
+        print("  --json           以 JSON 输出，便于脚本消费")
+        print("  --               之后的内容按位置参数处理（用于 - 开头的别名）")
         return 0
-    target, yes_flag, force, purge, as_json = _parse_remove_cli_args(args_list)
-    if not target:
-        print(f"{COLOR_RED}请提供要删除的账号名。{COLOR_RESET}")
+    try:
+        opts = _parse_remove_cli_args(args_list)
+    except RemoveArgsError as e:
+        print(f"{COLOR_RED}参数错误: {e}{COLOR_RESET}")
         print(REMOVE_USAGE)
         return 2
-    res = remove_profile(target, yes=yes_flag, force=force, purge=purge, as_json=as_json)
+
+    if opts["mode"] == "list":
+        return list_trash_cmd(as_json=opts["json"])
+    if opts["mode"] == "restore":
+        res = restore_from_trash(opts["restore"], yes=opts["yes"],
+                                 force=opts["force"], as_json=opts["json"])
+        return 0 if res.get("ok") else 1
+    res = remove_profile(opts["target"], yes=opts["yes"], force=opts["force"],
+                         purge=opts["purge"], as_json=opts["json"])
     return 0 if res.get("ok") else 1
 
 def run_interactive_tool_cmd(args=None):
@@ -4431,7 +4672,8 @@ def main():
         alias = clean_args[0] if clean_args else None
         run_login(alias=alias, auto_switch=auto_switch, force=force)
         return
-    if "remove" in prog_name or clean_prog in ("wb-rm", "workbuddy-rm"):
+    # 精确匹配程序名，不做子串匹配：装在 /home/x/remove-tools/workbuddy 这类型录会被误判
+    if clean_prog in ("wb-remove", "workbuddy-remove", "wb-rm", "workbuddy-rm"):
         sys.exit(run_remove_cmd(args))
     if "audit" in prog_name:
         if any(a in ("-h", "--help", "help") for a in args):

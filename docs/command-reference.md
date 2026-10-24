@@ -13,7 +13,7 @@
 | `wb-list` | 列出已保存账号 | 查看有哪些账号可用 |
 | `wb-status` | 查看当前账号状态 | 确认当前身份和健康状态 |
 | `wb-switch` | 切换到另一个已保存账号 | 不重新登录直接换号 |
-| `wb-remove` | 删除本地已保存的账号凭证 | 清理不再使用的账号 |
+| `wb-remove` | 删除本地已保存的账号凭证（可列出/还原回收站） | 清理不再使用的账号 |
 | `wb-audit` | 巡检凭据健康度 | 检查过期或刷新问题 |
 | `wb-checkin` | 执行每日签到 / 连续任务 | 手动或定时日常任务 |
 | `wb-usage` | 查看使用量 / 积分流速 | 分析一段时间的消耗 |
@@ -78,31 +78,52 @@ wb-switch
 ### 删除账号
 
 ```bash
-wb-remove <账号名>
+workbuddy remove <账号名|昵称|UID> [--yes] [--force] [--purge] [--json]
+workbuddy remove --list-trash [--json]
+workbuddy remove --restore <回收站文件名> [--yes] [--force] [--json]
 ```
 
+（`wb-remove` 是安装后提供的别名，参数完全相同。）
+
 删除的是本地已保存的凭证文件，不涉及服务端账号，也不会删除该账号的会话历史与工作区数据。
+
+参数：
+
+| 参数 | 含义 |
+|---|---|
+| `-y` / `--yes` / `--confirm` | 跳过交互确认。非 TTY 环境（管道、cron、定时任务）**必须**带上，否则直接拒绝执行（退出码 1） |
+| `--force` | 只表示「放宽保护」：删除当前活跃账号、删除身份未知的损坏凭证、恢复时覆盖同名账号。**不再与 `-y` 互为别名**，不能替代确认 |
+| `--purge` | 永久删除，不进回收站 |
+| `--json` | 输出机器可读结果 |
+| `--` | 之后的内容一律按位置参数处理，用于 `-weird` 这类以连字符开头的账号别名，例如 `workbuddy remove --yes -- -weird` |
+
+未知选项、或给出的目标账号多于一个时，只打印用法并以**退出码 2** 结束，不执行任何删除。
 
 默认把凭证移入 `~/.workbuddy/auth_profiles_trash/`，需要彻底抹除时加 `--purge`：
 
 ```bash
-wb-remove old_acc --yes            # 移入回收站
-wb-remove old_acc --yes --purge    # 永久删除，不留副本
+workbuddy remove old_acc --yes            # 移入回收站
+workbuddy remove old_acc --yes --purge    # 永久删除，不留副本
 ```
+
+回收站里的备份文件名形如 `<别名>-<YYYYMMDD-HHMMSS>[-序号].info`，用 `O_CREAT|O_EXCL` 独占创建，避免并发删除同名账号时互相覆盖。
 
 保护规则：
 
 - 目标必须唯一匹配（别名 / 昵称 / UID 前缀），有歧义时列出候选并拒绝执行；
 - 删除当前活跃账号需要显式 `--force`：客户端会保持当前登录，但本地不再有备份，切走后只能重新扫码；
-- 非交互式环境（管道、cron、定时任务）必须显式 `--yes`，避免脚本误删；
+- 非交互式环境（管道、cron、定时任务）必须显式 `--yes`，否则直接拒绝（退出码 1），避免脚本误删；
 - 同一 UID 已无其他账号时，同步清理审计缓存，避免 `wb-status` / `wb-audit` 继续显示已删除账号；
-- 半截 JSON 之类的损坏凭证不会被 `wb-list` 收录，但仍可按别名删除（输出会标注身份未经校验）。
+- 半截 JSON 之类的损坏凭证不会被 `wb-list` 收录，此时按文件名兜底删除，但**必须显式 `--force`**，因为其身份无法校验（输出会标注身份未经校验）。
 
 误删可从回收站恢复：
 
 ```bash
-mv ~/.workbuddy/auth_profiles_trash/<别名>-<时间戳>.info ~/.workbuddy/auth_profiles/<别名>.info
+workbuddy remove --list-trash                                  # 列出文件名、大小、时间
+workbuddy remove --restore demo-20260101-000000.info --yes     # 还原为 auth_profiles/<别名>.info
 ```
+
+`--restore` 把该备份还原为 `~/.workbuddy/auth_profiles/<别名>.info`；目标已存在则拒绝，需要 `--force` 覆盖。
 
 如果账号别名刚好是 `remove` / `rm` / `delete` / `del` / `forget`，这几个词现在优先按子命令解析。切换这类账号请显式用 `workbuddy switch <别名>`；裸敲命令（如 `workbuddy rm`）只会打印用法，不会删除任何账号。
 

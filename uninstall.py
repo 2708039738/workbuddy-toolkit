@@ -12,6 +12,7 @@ https://github.com/FlapPearLabs/workbuddy-toolkit
     python3 uninstall.py --keep-config  # 保留 failover_router.json / log_guard.json 等配置
 
 始终保留: ~/.workbuddy/auth_profiles/ 下已保存的账号凭证。
+同时清理: ~/.workbuddy/auth_profiles_trash/ 中 workbuddy remove 移入的已删除凭证副本。
 """
 
 import os
@@ -32,6 +33,9 @@ DB_FILE = os.path.join(WORKBUDDY_DIR, "workbuddy.db")
 TOOLKIT_DIR = os.path.join(WORKBUDDY_DIR, "toolkit")
 MODELS_JSON = os.path.join(WORKBUDDY_DIR, "models.json")
 ROUTER_CONFIG = os.path.join(WORKBUDDY_DIR, "failover_router.json")
+# workbuddy remove 移入的已删除凭证副本：卸载时必须一起清掉，否则磁盘上仍留有凭据。
+# 注意与 auth_profiles/ 区分——后者是用户已保存的账号凭证，始终保留。
+AUTH_PROFILES_TRASH = os.path.join(WORKBUDDY_DIR, "auth_profiles_trash")
 
 _USE_COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
 COLOR_GREEN = "\033[92m" if _USE_COLOR else ""
@@ -242,6 +246,12 @@ def remove_toolkit_files(argv):
             print(f"{COLOR_GREEN}✔ 已清理 Toolkit 伴随组件目录 ({TOOLKIT_DIR}){COLOR_RESET}")
 
     _remove(os.path.join(WORKBUDDY_DIR, "toolkit-state"))
+
+    # 回收站里是 workbuddy remove 移入的已删除凭证副本，不属于配置，
+    # 因此不受 --keep-config 影响：磁盘上不应残留任何凭据副本。
+    if _remove(AUTH_PROFILES_TRASH):
+        print(f"{COLOR_GREEN}✔ 已清理删除账号回收站 ({AUTH_PROFILES_TRASH}){COLOR_RESET}")
+
     if "--keep-config" in argv:
         return
     removed = [rel for rel in TOOLKIT_OWNED_FILES if _remove(os.path.join(WORKBUDDY_DIR, rel))]

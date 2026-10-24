@@ -229,7 +229,7 @@ class TestPublishScope(unittest.TestCase):
         self.addCleanup(shutil.rmtree, root, True)
         a = {"alias": "alpha", "uid": "uid-a"}
         b = {"alias": "beta", "uid": "uid-b"}
-        origin = "# 记忆\n" + "\n".join("- 自有事实 {:04d} {}".format(i, "内" * 50) for i in range(60))
+        origin = "# 记忆\n" + "\n".join("- 自有事实 {:04d} {}".format(i, "内" * 50) for i in range(45))
         for acc, text in ((a, origin),
                           (b, "# 记忆\n" + "\n".join(
                               "- 必须遵守外来准则 {:02d} {}".format(i, "外" * 50) for i in range(12)))):
@@ -447,6 +447,86 @@ class TestShardIndex(unittest.TestCase):
         again = ms.apply_account(self.a, root=self.root)
         self.assertEqual(again["action"], "unchanged")
         self.assertEqual(again["indexed"], 0)
+
+
+class TestRenderRegressions(unittest.TestCase):
+    """对抗验证抓到的 5 个真缺陷，逐条钉死。"""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def _mk(self, acc, text, newline=""):
+        d = ms.memory_dir(self.root, acc["uid"])
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "MEMORY.md")
+        with open(path, "w", encoding="utf-8", newline=newline) as f:
+            f.write(text)
+        return path
+
+    def test_33_crlf_is_preserved(self):
+        """T33: CRLF 文件不能被改写成 LF，且第二次 apply 必须是 unchanged"""
+        a = {"alias": "alpha", "uid": "uid-a"}
+        b = {"alias": "beta", "uid": "uid-b"}
+        path = self._mk(a, "# 记忆\r\n- 提交前必须跑测试\r\n")
+        self._mk(b, "# 记忆\n- 必须遵守外来准则\n")
+        before = open(path, "rb").read()
+
+        ms.collect([a, b], root=self.root)
+        ms.apply_account(a, root=self.root)
+        after = open(path, "rb").read()
+
+        self.assertTrue(after.startswith(before.rstrip()), "原文逐字保留")
+        self.assertGreater(after.count(b"\r\n"), before.count(b"\r\n"), "新增内容也应用 CRLF")
+        self.assertEqual(after.count(b"\n") - after.count(b"\r\n"), 0, "不能出现裸 LF")
+
+        res = ms.apply_account(a, root=self.root)
+        self.assertEqual(res["action"], "unchanged", "字节相同就不能报 updated")
+
+    def test_34_no_double_bullet(self):
+        """T34: 条目自带 "- " 时不能再拼一个列表符"""
+        a = {"alias": "alpha", "uid": "uid-a"}
+        b = {"alias": "beta", "uid": "uid-b"}
+        path = self._mk(a, "# 记忆\n- 自有\n")
+        self._mk(b, "# 记忆\n- 必须遵守外来准则\n")
+        ms.collect([a, b], root=self.root)
+        ms.apply_account(a, root=self.root)
+        text = open(path, encoding="utf-8").read()
+        self.assertIn("- 必须遵守外来准则", text)
+        self.assertNotIn("- - ", text)
+
+    def test_35_local_fact_variants_blocked(self):
+        """T35: ~/、../、全角盘符、环境变量都算本机事实"""
+        for text in ("- 资料在 ~/docs 下", "- 配置在 ../conf 下",
+                     "- 盘符 Ｄ：\\work", "- 变量 %APPDATA% 下"):
+            self.assertTrue(ms.is_local_fact(text), text)
+        self.assertFalse(ms.is_local_fact("- 提交前必须跑测试"))
+
+    def test_36_render_never_exceeds_limit(self):
+        """T36: 任意条目数下渲染结果都不越过 4000，且原文不动"""
+        origin = "# 记忆\n" + "\n".join(
+            "- 自有条目 {:04d} {}".format(i, "内" * 57) for i in range(50))
+        for n in range(0, 31):
+            text, _, _, _ = ms.render(origin, [{"text": "- 必须遵守这一条准则"}] * n,
+                                      limit=ms.INJECT_LIMIT)
+            self.assertLessEqual(len(text.strip()), ms.INJECT_LIMIT, "n={}".format(n))
+
+    def test_37_lock_failure_returns_not_raises(self):
+        """T37: 锁超时要返回 locked，不能让批量同步整体中断"""
+        a = {"alias": "alpha", "uid": "uid-a"}
+        self._mk(a, "# 记忆\n- 自有\n")
+
+        def boom(*args, **kwargs):
+            raise ms.MemoryLockTimeout("busy")
+
+        original = ms.file_lock
+        ms.file_lock = boom
+        try:
+            res = ms.apply_account(a, root=self.root)
+        finally:
+            ms.file_lock = original
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["action"], "locked")
 
 
 class TestMemoryHubCli(unittest.TestCase):

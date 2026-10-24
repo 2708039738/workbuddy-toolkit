@@ -199,6 +199,19 @@ def read_text(path):
         return ""
 
 
+def read_text_exact(path):
+    """按字节读、不转换换行符。
+
+    快照 / 还原必须走这条路径：`read_text()` 会把 CRLF 折成 LF，
+    于是"第一次 apply 什么都没改"却把整篇文件的换行符换掉了。
+    """
+    try:
+        with open(path, "rb") as f:
+            return f.read().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
 def read_text_checked(path):
     """返回 (文本, 状态)。状态: ok | missing | not_utf8 | unreadable。
 
@@ -433,7 +446,8 @@ HABIT_WORDS = ("偏好", "喜欢", "倾向", "简洁", "详细", "语气", "中�
 
 # 出现这些就说明是"某台机器上的事"，不是跨账号通用的规则
 _LOCAL_FACT_PAT = re.compile(
-    r"[A-Za-z]:[\\/]|/Users/|/home/|\\\\|https?://"
+    r"[A-Za-z]:[\\/]|/Users/|/home/|\\\\|https?://|file://"
+    r"|~[\\/]|\.\.[\\/]|%[A-Za-z_]+%|\$HOME"
     r"|[\w.+-]+@[\w-]+\.[\w.]+"
     r"|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
     re.IGNORECASE)
@@ -464,7 +478,14 @@ def publish_level(text):
 
 
 def is_local_fact(text):
-    return bool(_LOCAL_FACT_PAT.search(str(text or "")))
+    r"""含"只在这台机器上成立"的细节：盘符/UNC/home 路径、相对上级路径、
+    环境变量、URL、邮箱、UUID。
+
+    先做 NFKC：全角 `Ｄ：\work` 与半角 `D:\work` 是同一个东西，
+    不归一化就能被一个全角冒号绕过。
+    """
+    norm = unicodedata.normalize("NFKC", str(text or ""))
+    return bool(_LOCAL_FACT_PAT.search(norm))
 
 
 def publishable(entries, budget=PUBLISH_BUDGET, max_level=PUBLISH_MAX_LEVEL,
@@ -516,8 +537,10 @@ def absorb(baseline_text, current_text):
     - 都不相似 → 追加到末尾。
     基线里原有但当前文件没有的条目**不删除**——"不丢失"优先于"可删除"。
     """
-    baseline = (baseline_text or "").rstrip()
-    lines = baseline.splitlines()
+    baseline = baseline_text or ""
+    stripped = baseline.rstrip()
+    eol = "\r\n" if "\r\n" in stripped else "\n"
+    lines = stripped.splitlines() if stripped else []
     index = {normalize(l): i for i, l in enumerate(lines) if normalize(l)}
     added = upgraded = 0
 
@@ -543,7 +566,11 @@ def absorb(baseline_text, current_text):
         index[norm] = len(lines) - 1
         added += 1
 
-    return "\n".join(lines).rstrip() + "\n", added, upgraded
+    if not added and not upgraded:
+        # 没有新条目就原样返回：`"\n".join()` 会把 CRLF 全文改写成 LF，
+        # 一次"什么都没改"的 apply 也能把用户文件的字节全换掉。
+        return baseline, 0, 0
+    return eol.join(lines).rstrip() + eol, added, upgraded
 
 
 def summarize(text, limit=INDEX_SUMMARY_CHARS):
@@ -572,6 +599,15 @@ def build_index_line(entry, rel):
     return head + summarize(entry.get("text", ""), max(8, min(INDEX_SUMMARY_CHARS, room))) + tail
 
 
+_LIST_PREFIX = re.compile(r"^[-*+•]\s+")
+
+
+def _bullet(text):
+    """条目 → 渲染行。条目本身可能已经带 "- "（候选行保留了列表符），
+    再拼一次就会出现 "- - xxx"，所以先剥掉原前缀。"""
+    return "- " + _LIST_PREFIX.sub("", str(text or "").strip())
+
+
 def render(origin_text, shared_entries, limit=INJECT_LIMIT, index_entries=None):
     """基线原文 + 共享段落（+ 索引区）。返回 (全文, 写入条数, 截断条数, 索引条数)。
 
@@ -579,62 +615,64 @@ def render(origin_text, shared_entries, limit=INJECT_LIMIT, index_entries=None):
     绝不为了塞共享而截断原文——那等于用别人的记忆挤掉自己的记忆。
     索引区排在正式条目之后、结尾提示之前，同样只吃剩余预算：
     连原文都放不下的账号，索引也不会被硬塞进去。
+
+    预算按**最终拼出来的字节数**校验，不靠加减法估算——
+    估算漏掉分隔符就会写出 4001 字的文件，而客户端只认前 4000 字。
     """
     origin = (origin_text or "").rstrip()
     index_entries = list(index_entries or [])
     if not shared_entries and not index_entries:
         return origin + "\n", 0, 0, 0
 
+    # 保留原文的换行风格：CRLF 文件不能被我改写成 LF，那是"原文一字不改"的底线
+    eol = "\r\n" if "\r\n" in origin else "\n"
     header = [BEGIN_MARK, SHARED_HEADER, ""]
-    used = len(origin) + sum(len(x) + 1 for x in header) + len(END_MARK) + 2
+    footer_tpl = "- （另有 {} 条共享记忆未展开，超出单次注入上限）"
+
+    def compose(lines, footer=None):
+        tail = list(lines) + ([footer] if footer else [])
+        return origin + eol * 2 + eol.join(header + tail + ["", END_MARK]) + eol
+
     body = []
     overflow = 0
     for entry in shared_entries:
-        line = "- " + entry["text"].strip()
-        if used + len(line) + 1 > limit:
+        line = _bullet(entry.get("text"))
+        if len(compose(body + [line])) > limit:
             overflow = len(shared_entries) - len(body)
             break
         body.append(line)
-        used += len(line) + 1
     written = len(body)
 
-    # 结尾提示：先按正式条目占用的额度算，索引只能在它之后剩下的地方落
     footer = None
     if overflow:
-        remaining = overflow
-        footer = "- （另有 {} 条共享记忆未展开，超出单次注入上限）".format(remaining)
-        # 结尾提示也要算进预算：不为了写这句话而突破 4000 字上限
-        while body and used + len(footer) + 1 > limit:
-            dropped = body.pop()
-            used -= len(dropped) + 1
-            remaining += 1
-            footer = "- （另有 {} 条共享记忆未展开，超出单次注入上限）".format(remaining)
-        if used + len(footer) + 1 <= limit:
-            used += len(footer) + 1
-        else:
+        total = overflow
+        footer = footer_tpl.format(total)
+        while body and len(compose(body, footer)) > limit:
+            body.pop()
+            total += 1
+            footer = footer_tpl.format(total)
+        if len(compose(body, footer)) > limit:
             footer = None
+        written = len(body)
 
     index_lines = []
-    if index_entries and used + len(INDEX_MARKER) + 1 <= limit:
-        room = used + len(INDEX_MARKER) + 1
+    if index_entries and len(compose(body + [INDEX_MARKER], footer)) <= limit:
         for entry in index_entries[:MAX_INDEX_LINES]:
             line = clip_index_line(entry.get("index_line"))
             if not line:
                 continue
-            if room + len(line) + 1 > limit:
+            if len(compose(body + [INDEX_MARKER] + index_lines + [line], footer)) > limit:
                 break
             index_lines.append(line)
-            room += len(line) + 1
-        if index_lines:
-            used = room
 
-    body = body + ([INDEX_MARKER] + index_lines if index_lines else [])
-    if footer:
-        body.append(footer)
-
-    if not body:
+    lines = body + ([INDEX_MARKER] + index_lines if index_lines else [])
+    if not lines:
         return origin + "\n", 0, len(shared_entries), 0
-    text = origin + "\n\n" + "\n".join(header + body + ["", END_MARK]) + "\n"
+    text = compose(lines, footer)
+    if len(text) > limit:
+        # 兜底：上面每一步都按最终长度校验过，走到这里说明有未预料的溢出。
+        # 宁可少写一条共享，也不能写出一个会被客户端截断的文件。
+        return origin + "\n", 0, len(shared_entries), 0
     return text, written, max(0, len(shared_entries) - written), len(index_lines)
 
 
@@ -739,8 +777,16 @@ def rebalance_account(acc, root=None, target=3200, apply=False):
     这样即使中途失败，MEMORY 原文仍在，最坏情况是多了两段可清理的内容。
     """
     root = root or default_root()
-    with file_lock(root):
-        return _rebalance_locked(acc, root, target, apply)
+    alias = acc.get("alias") or acc.get("uid")
+    try:
+        with file_lock(root):
+            return _rebalance_locked(acc, root, target, apply)
+    except MemoryLockTimeout as e:
+        return {"ok": False, "alias": alias, "action": "locked", "reason": str(e),
+                "apply": bool(apply), "plan": None, "written": [], "backups": []}
+    except OSError as e:
+        return {"ok": False, "alias": alias, "action": "write_failed", "reason": str(e),
+                "apply": bool(apply), "plan": None, "written": [], "backups": []}
 
 
 def _rebalance_locked(acc, root, target, apply):
@@ -1101,7 +1147,7 @@ def _ensure_snapshot(root, uid, memory_path, current_text=None):
     """首次接入时保存基线快照；已存在则原样返回，绝不覆盖。"""
     path = snapshot_path(root, uid)
     if os.path.isfile(path):
-        return read_text(path)
+        return read_text_exact(path)
     current = strip_shared_block(current_text if current_text is not None else read_text(memory_path))
     atomic_write_text(path, current)
     return current
@@ -1112,11 +1158,26 @@ def apply_account(acc, root=None, lib=None, budget=PUBLISH_BUDGET,
     """把一个账号的 MEMORY.md 渲染成「基线原文 + 共享段落」。
 
     返回 {ok, alias, action, shared, truncated, added, upgraded, backup, skipped}
-    action: created | updated | unchanged | no_memory_file | error
+    action: created | updated | unchanged | no_memory_file | error | locked | write_failed
+
+    锁拿不到、目录不可写都必须变成返回值而不是异常：这个函数会在切号流程里
+    被批量调用，一次异常会把后面所有账号的同步都中断掉。
     """
     root = root or default_root()
-    with file_lock(root):
-        return _apply_locked(acc, root, lib, budget, max_level)
+    alias = acc.get("alias") or acc.get("uid")
+    blank = {"ok": False, "alias": alias, "action": "error", "shared": 0,
+             "truncated": 0, "added": 0, "upgraded": 0, "backup": None, "skipped": {}}
+    try:
+        with file_lock(root):
+            return _apply_locked(acc, root, lib, budget, max_level)
+    except MemoryLockTimeout as e:
+        blank["action"] = "locked"
+        blank["reason"] = str(e)
+        return blank
+    except OSError as e:
+        blank["action"] = "write_failed"
+        blank["reason"] = str(e)
+        return blank
 
 
 def _apply_locked(acc, root, lib, budget, max_level):
@@ -1260,17 +1321,23 @@ def compact(root=None, shard_min=SHARD_MIN_CHARS):
 
 
 def apply_all(accounts, root=None, budget=PUBLISH_BUDGET, max_level=PUBLISH_MAX_LEVEL):
-    with file_lock(root):
-        lib = load_library(root)
-        return [apply_account(a, root=root, lib=lib, budget=budget, max_level=max_level)
-                for a in accounts or []]
+    # 不在这里整批持锁：每个账号自己取锁，一个账号拿不到锁不会拖死其余账号
+    lib = load_library(root)
+    return [apply_account(a, root=root, lib=lib, budget=budget, max_level=max_level)
+            for a in accounts or []]
 
 
 def restore_account(acc, root=None):
     """把基线快照原样写回账号文件；写回前备份当前文件。"""
     root = root or default_root()
-    with file_lock(root):
-        return _restore_locked(acc, root)
+    alias = acc.get("alias") or acc.get("uid")
+    try:
+        with file_lock(root):
+            return _restore_locked(acc, root)
+    except MemoryLockTimeout as e:
+        return {"ok": False, "alias": alias, "action": "locked", "reason": str(e)}
+    except OSError as e:
+        return {"ok": False, "alias": alias, "action": "write_failed", "reason": str(e)}
 
 
 def _restore_locked(acc, root):
@@ -1285,7 +1352,7 @@ def _restore_locked(acc, root):
         result["action"] = "no_memory_file"
         return result
     result["backup"] = backup_file(path, root)
-    atomic_write_text(path, read_text(snap))
+    atomic_write_text(path, read_text_exact(snap))
     result["ok"] = True
     result["action"] = "restored"
     return result

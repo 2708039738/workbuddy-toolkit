@@ -46,7 +46,7 @@ WorkBuddy 客户端按账号读取几个长期记忆文件，单个文件超出�
 
 | 形式 | 例子 |
 |---|---|
-| 本机绝对路径 | `D:\work\app`、`/Users/me/proj`、`/home/me/proj`、`\\host\share` |
+| 本机绝对路径 | `D:\work\app`、`<用户主目录>/proj`、`\\host\share` |
 | URL | `https://internal.example.com` |
 | 邮箱 | `someone@example.com` |
 | UUID | `3f2b8c1e-9d4a-4c7b-8e6f-0a1b2c3d4e5f` |

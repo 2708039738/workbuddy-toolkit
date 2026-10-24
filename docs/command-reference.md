@@ -82,6 +82,8 @@ workbuddy memory collect          # 汇总所有账号 MEMORY.md，去重并保�
 workbuddy memory apply [账号]     # 渲染进指定账号（省略则全部）
 workbuddy memory status           # 库规模、各账号自有/共享条数、字数
 workbuddy memory restore <账号>   # 用基线快照还原（还原前自动备份）
+workbuddy memory rebalance        # 把准则/画像分流到 SOUL、USER（默认只出计划）
+workbuddy memory rebalance --apply --target 3200
 workbuddy memory on / off         # 开启 / 关闭切号时自动汇总渲染
 ```
 
@@ -89,7 +91,9 @@ workbuddy memory on / off         # 开启 / 关闭切号时自动汇总渲染
 - **不丢版本**：疑似重复时保留质量更高的一条，落选版本进 `superseded` 留档；
 - **可还原**：`restore` 按快照写回，备份在 `cache/shared_memory/backups/`；
 - **相似判定保守**：只合并 ≥0.90 的近重复，且数字不同一律不合并（`30s` ≠ `60s`）；
-- 客户端只读前 4000 字，预算优先给账号自有内容，共享条目放不下会标注条数。
+- 客户端只读前 4000 字，预算优先给账号自有内容，共享条目放不下会标注条数；
+- `rebalance` 解决容量：客户端其实有四个常驻通道（`MEMORY.md` 4000、`SOUL.md`/`USER.md`/`IDENTITY.md` 各 10000），
+  把“准则”分流到 SOUL、“画像”分流到 USER，同样一份记忆可以完整保留而不被截断。默认只打印计划，`--apply` 才写，写前备份。
 
 ## 健康检查与诊断
 

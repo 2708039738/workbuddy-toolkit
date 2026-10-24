@@ -312,5 +312,81 @@ class TestMemoryHubCli(unittest.TestCase):
             self.assertIn(line, snap, "用户正文不能被误判为共享段而丢失")
 
 
+    def test_16_classify_routes_by_nature(self):
+        """T16: 分诊按“关于人 / 怎么做 / 什么事”归类，分不清的留在 MEMORY"""
+        self.assertEqual(ms.classify_line("- 称呼我 ser"), "user")
+        self.assertEqual(ms.classify_line("- 提交前必须跑全量测试"), "soul")
+        self.assertEqual(ms.classify_line("- 项目路径在 D:/work/pr"), "memory")
+        self.assertEqual(ms.classify_line("# 一级标题"), "memory", "标题不参与搬迁")
+
+    def test_17_plan_only_moves_overflow(self):
+        """T17: 未超目标时一行都不搬；超了才搬，且搬完不超过目标"""
+        small = "# 记忆\n" + "\n".join("- 事实 {}".format(i) for i in range(5))
+        plan = ms.plan_rebalance(small, target=3200)
+        self.assertEqual(plan["moved_soul"], [])
+        self.assertEqual(plan["moved_user"], [])
+
+        big = "# 记忆\n" + "\n".join(
+            ["- 事实 {}".format(i) for i in range(20)]
+            + ["- 必须遵守的准则第 {} 条".format(i) for i in range(120)]
+        )
+        plan = ms.plan_rebalance(big, target=1200)
+        self.assertGreater(len(plan["moved_soul"]), 0)
+        self.assertLessEqual(plan["memory_size"], 1200)
+        self.assertEqual(plan["memory_size"] + plan["moved_soul_size"]
+                         + plan["moved_user_size"], sum(len(l) + 1 for l in big.splitlines()))
+
+    def test_18_rebalance_dry_run_writes_nothing(self):
+        """T18: 默认只出计划，不写任何文件"""
+        acc = {"alias": "alpha", "uid": "uid-a"}
+        d = ms.memory_dir(self.root, "uid-a")
+        os.makedirs(d, exist_ok=True)
+        mem = os.path.join(d, "MEMORY.md")
+        with open(mem, "w", encoding="utf-8") as f:
+            f.write("# 记忆\n" + "\n".join("- 必须遵守准则 {}".format(i) for i in range(200)))
+        before = open(mem, encoding="utf-8").read()
+        res = ms.rebalance_account(acc, root=self.root, target=500, apply=False)
+        self.assertEqual(res["action"], "planned")
+        self.assertEqual(open(mem, encoding="utf-8").read(), before)
+        self.assertFalse(os.path.exists(os.path.join(d, "SOUL.md")))
+
+    def test_19_rebalance_apply_moves_and_preserves(self):
+        """T19: 执行后 MEMORY 瘦身、SOUL/USER 各得一段，且有备份可还原"""
+        acc = {"alias": "alpha", "uid": "uid-a"}
+        d = ms.memory_dir(self.root, "uid-a")
+        os.makedirs(d, exist_ok=True)
+        mem = os.path.join(d, "MEMORY.md")
+        soul = os.path.join(d, "SOUL.md")
+        user = os.path.join(d, "USER.md")
+        with open(soul, "w", encoding="utf-8") as f:
+            f.write("# SOUL.md - Who You Are\n\n原有内容\n")
+        with open(user, "w", encoding="utf-8") as f:
+            f.write("# USER.md\n\n- 称呼 ser\n")
+        with open(mem, "w", encoding="utf-8") as f:
+            f.write("# 记忆\n"
+                    + "\n".join("- 必须遵守准则 {}".format(i) for i in range(80))
+                    + "\n" + "\n".join("- 事实条目 {}".format(i) for i in range(10)))
+
+        res = ms.rebalance_account(acc, root=self.root, target=800, apply=True)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["action"], "rebalanced")
+        self.assertEqual(len(res["backups"]), 3)
+
+        self.assertLessEqual(len(open(mem, encoding="utf-8").read()), 800 + 40)
+        soul_text = open(soul, encoding="utf-8").read()
+        self.assertIn("原有内容", soul_text, "原有内容不能被删")
+        self.assertIn(ms.REBALANCE_BEGIN, soul_text)
+        self.assertIn("必须遵守准则 0", soul_text)
+
+        # 幂等：再跑一次不会重复追加段落
+        ms.rebalance_account(acc, root=self.root, target=800, apply=True)
+        soul_text2 = open(soul, encoding="utf-8").read()
+        self.assertEqual(soul_text2.count(ms.REBALANCE_BEGIN), 1)
+
+        # restore 能把 MEMORY 还原
+        ms.restore_account(acc, root=self.root)
+        self.assertIn("必须遵守准则 0", open(mem, encoding="utf-8").read())
+
+
 if __name__ == "__main__":
     unittest.main()

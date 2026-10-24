@@ -398,6 +398,172 @@ def render(origin_text, shared_entries, limit=INJECT_LIMIT):
 
 
 # ----------------------------------------------------------------------------
+# 记忆分诊（rebalance）：把 MEMORY.md 的内容按性质分流到容量更大的常驻通道
+# ----------------------------------------------------------------------------
+# 客户端有四个常驻通道，上限不同：
+#   MEMORY.md  4000   —— 事实、配置、项目状态
+#   SOUL.md   10000   —— 行为准则、红线、流程
+#   USER.md   10000   —— 称呼、语言、沟通偏好
+#   IDENTITY.md 10000 —— 身份元数据（不放记忆）
+# 把全部内容堆在 MEMORY.md 是容量浪费：分诊后同样一份记忆可以完整保留，
+# 而不是被 4000 字截掉三分之一。
+
+REBALANCE_BEGIN = "<!-- memory-rebalance:begin -->"
+REBALANCE_END = "<!-- memory-rebalance:end -->"
+
+USER_MARKERS = ("称呼", "叫我", "昵称", "名字", "语言", "中文", "英文",
+                "沟通", "语气", "画像", "回复风格", "称呼为")
+SOUL_MARKERS = ("必须", "禁止", "不要", "不得", "默认", "一律", "始终", "永远",
+                "优先", "流程", "步骤", "红线", "纪律", "规则", "规范",
+                "提交", "测试", "分支", "推送", "审查", "命名", "格式")
+
+
+def classify_line(line):
+    """按"关于人 / 怎么做 / 什么事"给一行记忆分诊。
+
+    纯关键词规则，刻意保守：分不清就留在 MEMORY（原处），不硬塞。
+    迁移是可逆的，但把事实误塞进人格通道会让行为变怪，代价比多占几百字高。
+    """
+    s = str(line or "").strip()
+    if not s or s.startswith("#") or s.startswith("<!--"):
+        return "memory"
+    if any(k in s for k in USER_MARKERS):
+        return "user"
+    if any(k in s for k in SOUL_MARKERS):
+        return "soul"
+    return "memory"
+
+
+def strip_rebalance_section(text):
+    """移除上一次分诊写入的受管段落（SOUL/USER 各一段）。"""
+    if not text or REBALANCE_BEGIN not in text:
+        return text
+    start = text.find(REBALANCE_BEGIN)
+    end = text.find(REBALANCE_END)
+    if end == -1:
+        return text
+    return (text[:start] + text[end + len(REBALANCE_END):]).rstrip() + "\n"
+
+
+def plan_rebalance(memory_text, target=3200):
+    """算出"哪些行留在 MEMORY、哪些搬到 SOUL/USER"。
+
+    只在 MEMORY 超过 target 时才搬，且优先搬 SOUL 类（通常占比最大），
+    搬到 target 以下立即停止——不做无谓的整体迁移。
+    """
+    lines = str(memory_text or "").splitlines()
+    kinds = [classify_line(line) for line in lines]
+    total = sum(len(line) + 1 for line in lines)
+    moved_idx = set()
+    moved = {"soul": [], "user": []}
+
+    remaining = total
+    if remaining > target:
+        for kind in ("soul", "user"):
+            for i, line in enumerate(lines):
+                if remaining <= target:
+                    break
+                if kinds[i] != kind or i in moved_idx:
+                    continue
+                moved[kind].append(line)
+                moved_idx.add(i)
+                remaining -= len(line) + 1
+
+    kept = [line for i, line in enumerate(lines) if i not in moved_idx]
+    kept_size = sum(len(line) + 1 for line in kept)
+    return {
+        "lines_in": len(lines),
+        "memory_lines": len(kept),
+        "memory_size": kept_size,
+        "target": target,
+        "moved_soul": moved["soul"],
+        "moved_user": moved["user"],
+        "moved_soul_size": sum(len(x) + 1 for x in moved["soul"]),
+        "moved_user_size": sum(len(x) + 1 for x in moved["user"]),
+        "kept": kept,
+        "overflow_before": max(0, total - target),
+    }
+
+
+def _render_channel_section(title, lines):
+    body = "\n".join(lines)
+    return "{}\n## {}\n\n{}\n{}\n".format(REBALANCE_BEGIN, title, body, REBALANCE_END)
+
+
+def rebalance_account(acc, root=None, target=3200, apply=False):
+    """把一个账号的记忆按通道重新分配。
+
+    apply=False（默认）只返回计划，不写任何文件。
+    写入顺序：先备份三个文件 → 写 SOUL/USER 的新段落 → 最后改 MEMORY，
+    这样即使中途失败，MEMORY 原文仍在，最坏情况是多了两段可清理的内容。
+    """
+    root = root or default_root()
+    uid = str(acc.get("uid") or "").strip()
+    d = memory_dir(root, uid, acc.get("enterprise_id"))
+    result = {"ok": False, "alias": acc.get("alias") or uid, "apply": bool(apply),
+              "plan": None, "written": [], "backups": []}
+    if not d:
+        result["action"] = "no_memory_file"
+        return result
+    mem_path = os.path.join(d, MEMORY_FILE)
+    soul_path = os.path.join(d, "SOUL.md")
+    user_path = os.path.join(d, "USER.md")
+    mem_text, state = read_text_checked(mem_path)
+    if state != "ok":
+        result["action"] = "skipped_encoding" if state == "not_utf8" else "no_memory_file"
+        return result
+
+    plan = plan_rebalance(mem_text, target=target)
+    soul_before = len(read_text(soul_path))
+    user_before = len(read_text(user_path))
+    result["projected"] = {
+        "memory_before": len(mem_text),
+        "memory_after": plan["memory_size"],
+        "soul_before": soul_before,
+        "soul_after": soul_before + plan["moved_soul_size"],
+        "user_before": user_before,
+        "user_after": user_before + plan["moved_user_size"],
+    }
+    result["plan"] = {
+        "memory_size": plan["memory_size"],
+        "moved_soul": len(plan["moved_soul"]),
+        "moved_user": len(plan["moved_user"]),
+        "moved_soul_size": plan["moved_soul_size"],
+        "moved_user_size": plan["moved_user_size"],
+        "target": target,
+    }
+    if not apply or (not plan["moved_soul"] and not plan["moved_user"]):
+        result["ok"] = True
+        result["action"] = "planned" if apply is False else "nothing_to_do"
+        return result
+
+    # 先留存基线快照（供 restore 还原），再备份三个文件，最后才写
+    _ensure_snapshot(root, uid, mem_path, current_text=mem_text)
+    for p in (mem_path, soul_path, user_path):
+        b = backup_file(p, root)
+        if b:
+            result["backups"].append(b)
+
+    if plan["moved_soul"]:
+        soul_text = strip_rebalance_section(read_text(soul_path))
+        soul_text = soul_text.rstrip() + "\n\n" + _render_channel_section(
+            "工作准则（来自长期记忆）", plan["moved_soul"])
+        atomic_write_text(soul_path, soul_text)
+        result["written"].append("SOUL.md")
+
+    if plan["moved_user"]:
+        user_text = strip_rebalance_section(read_text(user_path))
+        user_text = user_text.rstrip() + "\n\n" + _render_channel_section(
+            "用户偏好（来自长期记忆）", plan["moved_user"])
+        atomic_write_text(user_path, user_text)
+        result["written"].append("USER.md")
+
+    atomic_write_text(mem_path, "\n".join(plan["kept"]).rstrip() + "\n")
+    result["written"].append(MEMORY_FILE)
+    result["ok"] = True
+    result["action"] = "rebalanced"
+    return result
+# ----------------------------------------------------------------------------
 # 共享库
 # ----------------------------------------------------------------------------
 def empty_library():

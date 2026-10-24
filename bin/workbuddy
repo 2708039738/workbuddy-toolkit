@@ -4259,8 +4259,8 @@ def _sync_memory_on_switch(target):
     except Exception as e:
         print(f"{COLOR_YELLOW}  [记忆] 汇总失败（已忽略，不影响切号）: {e}{COLOR_RESET}")
 
-MEMORY_USAGE = ("用法: workbuddy memory [collect | apply [账号] | status | "
-                "restore <账号> | on | off] [--json]")
+MEMORY_USAGE = ("用法: workbuddy memory [collect | apply [账号] | rebalance [账号] "
+                "[--apply] | status | restore <账号> | on | off] [--json]")
 
 def run_memory_cmd(args_list):
     """`workbuddy memory` 子命令入口。退出码: 0 成功，1 失败，2 参数缺失。"""
@@ -4268,6 +4268,8 @@ def run_memory_cmd(args_list):
         print(MEMORY_USAGE)
         print("  collect        汇总所有账号 MEMORY.md，去重并保留质量更优的版本")
         print("  apply [账号]   把共享记忆渲染进指定账号（省略则全部）；原文只追加不改写")
+        print("  rebalance      把 MEMORY.md 的准则/画像分流到 SOUL/USER（10k 通道），默认只出计划")
+        print("                 --apply 执行；--target N 指定 MEMORY 目标字数（默认 3200）")
         print("  status         查看库规模、各账号自有/共享条数与字数")
         print("  restore <账号> 用基线快照还原该账号 MEMORY.md（还原前自动备份）")
         print("  on / off       开启 / 关闭切号时自动汇总渲染")
@@ -4300,6 +4302,53 @@ def run_memory_cmd(args_list):
         (print(json.dumps({"enabled": False}, ensure_ascii=False)) if as_json
          else print(f"{COLOR_GREEN}✔ 已关闭自动汇总。已渲染的共享段落保持不变，"
                     f"可用 workbuddy memory restore <账号> 还原。{COLOR_RESET}"))
+        return 0
+
+    if action in ("rebalance", "triage"):
+        apply_flag = "--apply" in args_list
+        target_size = 3200
+        for i, arg in enumerate(args_list):
+            if arg == "--target" and i + 1 < len(args_list):
+                try:
+                    target_size = int(args_list[i + 1])
+                except ValueError:
+                    pass
+            elif arg.startswith("--target="):
+                try:
+                    target_size = int(arg.split("=", 1)[1])
+                except ValueError:
+                    pass
+        who = [a for a in clean[1:] if not a.startswith("--")]
+        if who:
+            _, prof = resolve_profile_target(get_profiles(), who[0], allow_uid_prefix=True, quiet=True)
+            if not prof:
+                print(f"{COLOR_RED}未找到唯一匹配 '{who[0]}' 的账号{COLOR_RESET}")
+                return 1
+            selected = [a for a in accounts if a["uid"] == str(prof.get("uid") or "")]
+        else:
+            selected = accounts
+        results = [ms.rebalance_account(a, root=root, target=target_size, apply=apply_flag)
+                   for a in selected]
+        if as_json:
+            print(json.dumps(results, ensure_ascii=False, indent=2))
+        else:
+            for r in results:
+                if r.get("action") in ("no_memory_file", "skipped_encoding"):
+                    print(f"  {r['alias']}: 跳过（{r['action']}）")
+                    continue
+                p = r.get("projected") or {}
+                print(f"  {r['alias']}: MEMORY {p.get('memory_before', 0)} → {p.get('memory_after', 0)} 字"
+                      f"（上限 {ms.INJECT_LIMIT}）")
+                print(f"    搬出 SOUL {r['plan']['moved_soul']} 行"
+                      f"（{p.get('soul_before', 0)} → {p.get('soul_after', 0)} / 10000）")
+                print(f"    搬出 USER {r['plan']['moved_user']} 行"
+                      f"（{p.get('user_before', 0)} → {p.get('user_after', 0)} / 10000）")
+                if r.get("action") == "rebalanced":
+                    print(f"    {COLOR_GREEN}✔ 已写入，备份 {len(r.get('backups', []))} 份{COLOR_RESET}")
+                elif r.get("action") == "nothing_to_do":
+                    print("    无需调整")
+                else:
+                    print(f"    {COLOR_CYAN}以上为计划，未写入；加 --apply 执行（执行前自动备份）{COLOR_RESET}")
         return 0
 
     if action in ("collect", "merge"):

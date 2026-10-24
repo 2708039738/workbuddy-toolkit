@@ -1684,6 +1684,62 @@ class TestWorkBuddyCore(unittest.TestCase):
         self.assertEqual(ctx3.exception.code, 2)
         self.assertTrue(os.path.exists(other))
 
+    def test_t59_remove_profile_trash_name_collision_keeps_both(self):
+        """T59: 同一秒内两次删除同名账号，回收站里两份备份都要保留（不能被覆盖）"""
+        import io
+
+        self._write_profile("dup", "uid-dup-1", "Dup")
+        with patch("sys.stdout", io.StringIO()):
+            first = workbuddy.remove_profile("dup", yes=True)
+        # 模拟"删掉后又用同一别名重新登录，再删一次"
+        self._write_profile("dup", "uid-dup-2", "Dup")
+        with patch("sys.stdout", io.StringIO()):
+            second = workbuddy.remove_profile("dup", yes=True)
+
+        self.assertTrue(first["ok"])
+        self.assertTrue(second["ok"])
+        self.assertNotEqual(first["trash_path"], second["trash_path"])
+
+        trash = workbuddy.get_profiles_trash_dir()
+        names = sorted(n for n in os.listdir(trash) if n.startswith("dup-"))
+        self.assertEqual(len(names), 2, f"回收站只剩 {names}，前一份备份被覆盖")
+        uids = set()
+        for n in names:
+            with open(os.path.join(trash, n), encoding="utf-8") as f:
+                uids.add(json.load(f)["account"]["uid"])
+        self.assertEqual(uids, {"uid-dup-1", "uid-dup-2"})
+
+    def test_t60_remove_profile_allows_cleaning_unparsable_credential(self):
+        """T60: 半截 JSON 的凭证不进 get_profiles()，但仍要能按别名清理"""
+        import io
+
+        broken = os.path.join(workbuddy.PROFILES_DIR, "broken.info")
+        with open(broken, "w", encoding="utf-8") as f:
+            f.write('{"account": {"uid": "uid-broken"')
+        self.assertNotIn("broken", workbuddy.get_profiles())
+
+        with patch("sys.stdout", io.StringIO()):
+            res = workbuddy.remove_profile("broken", yes=True)
+
+        self.assertTrue(res["ok"], res["message"])
+        self.assertTrue(res["unparsable"])
+        self.assertEqual(res["action"], "trashed")
+        self.assertFalse(os.path.exists(broken))
+        self.assertTrue(os.path.exists(res["trash_path"]))
+
+    def test_t61_remove_profile_alias_starting_with_dash(self):
+        """T61: 以 - 开头的别名（wb-login 允许创建）不能被参数解析吞掉"""
+        import io
+
+        path = self._write_profile("-weird", "uid-weird", "Weird")
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            with patch("sys.argv", ["workbuddy", "remove", "-weird", "--yes"]):
+                with self.assertRaises(SystemExit) as ctx:
+                    workbuddy.main()
+        self.assertEqual(ctx.exception.code, 0, buf.getvalue())
+        self.assertFalse(os.path.exists(path))
+
 if __name__ == "__main__":
     unittest.main()
 

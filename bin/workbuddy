@@ -2363,6 +2363,7 @@ def remove_profile(target_name, yes=False, force=False, purge=False, as_json=Fal
         "nickname": None,
         "action": "not_found",
         "was_active": False,
+        "unparsable": False,
         "trash_path": None,
         "message": "",
     }
@@ -2381,6 +2382,17 @@ def remove_profile(target_name, yes=False, force=False, purge=False, as_json=Fal
     profiles = get_profiles()
     alias, target = resolve_profile_target(profiles, target_name, allow_uid_prefix=True, quiet=True)
     available = ", ".join(sorted(profiles.keys())) or "(无)"
+    unparsable = False
+    if not target:
+        # 兜底：半截 JSON / 非 UTF-8 的凭证会被 get_profiles() 静默跳过，
+        # 但它仍然占着 auth_profiles/<别名>.info。不允许按文件名清理，
+        # 这类账号就永久删不掉了（重新扫码只是覆盖，不是删除）。
+        raw_alias = re.sub(r"[^\w\-]", "_", str(target_name or "")).strip("_")
+        raw_path = os.path.join(PROFILES_DIR, f"{raw_alias}.info")
+        if raw_alias and os.path.isfile(raw_path):
+            alias = raw_alias
+            target = {"path": raw_path, "uid": "", "nickname": f"{raw_alias}（凭证文件无法解析）"}
+            unparsable = True
     if not target:
         return _finish(
             f"未找到唯一匹配 '{target_name}' 的已保存账号。可用账号: {available}",
@@ -2394,6 +2406,7 @@ def remove_profile(target_name, yes=False, force=False, purge=False, as_json=Fal
     result["alias"] = alias
     result["uid"] = uid or None
     result["nickname"] = nickname
+    result["unparsable"] = unparsable
 
     active_data = get_active_account()
     active_acc = active_data.get("account") if isinstance(active_data, dict) else None
@@ -2439,7 +2452,14 @@ def remove_profile(target_name, yes=False, force=False, purge=False, as_json=Fal
         else:
             trash_dir = get_profiles_trash_dir()
             os.makedirs(trash_dir, exist_ok=True)
-            trash_path = os.path.join(trash_dir, f"{alias}-{time.strftime('%Y%m%d-%H%M%S')}.info")
+            # 同一秒内删同名账号（删完又从回收站恢复再删）不能共用文件名：
+            # shutil.move 到已存在的目标会直接覆盖，前一份备份就静默丢了。
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            trash_path = os.path.join(trash_dir, f"{alias}-{stamp}.info")
+            seq = 1
+            while os.path.exists(trash_path):
+                trash_path = os.path.join(trash_dir, f"{alias}-{stamp}-{seq}.info")
+                seq += 1
             shutil.move(src_path, trash_path)
             result["action"] = "trashed"
             result["trash_path"] = trash_path
@@ -2466,6 +2486,8 @@ def remove_profile(target_name, yes=False, force=False, purge=False, as_json=Fal
         message = f"已删除账号 '{alias}'，凭证已移入回收站"
     if was_active:
         lines.append(f"{COLOR_YELLOW}  注意: 该账号是当前活跃账号，客户端仍保持登录，但本地备份已移除。{COLOR_RESET}")
+    if unparsable:
+        lines.append(f"{COLOR_YELLOW}  注意: 该凭证文件无法解析，身份未经校验，仅按文件名删除。{COLOR_RESET}")
     lines.append(f"  剩余已存账号: {len(remaining)} 个")
     if not purge:
         lines.append(f"  误删可恢复: 把 {trash_path} 移回 {os.path.join(PROFILES_DIR, alias + '.info')}")
@@ -4288,13 +4310,20 @@ def _parse_audit_cli_args(args_list):
         i += 1
     return force, daemon_mode, interval_hours
 
+REMOVE_FLAGS = ("--yes", "-y", "--confirm", "--force", "-f", "--overwrite",
+                "--purge", "--json", "-j")
+
 def _parse_remove_cli_args(args_list):
-    """解析 remove/delete 子命令参数。返回 (target, yes, force, purge, as_json)。"""
+    """解析 remove/delete 子命令参数。返回 (target, yes, force, purge, as_json)。
+
+    只按"已知开关"剔除参数，不按 "-" 前缀剔除：
+    `wb-login "-weird"` 是能建出以 - 开头别名的，按前缀过滤会让这种账号永远删不掉。
+    """
     yes_flag = any(a in ("--yes", "-y", "--confirm") for a in args_list)
     force = any(a in ("--force", "-f", "--overwrite") for a in args_list)
     purge = any(a in ("--purge",) for a in args_list)
     as_json = any(a in ("--json", "-j") for a in args_list)
-    clean_args = [a for a in args_list if not a.startswith("-")]
+    clean_args = [a for a in args_list if a not in REMOVE_FLAGS]
     return (clean_args[0] if clean_args else None), yes_flag, force, purge, as_json
 
 REMOVE_USAGE = "用法: workbuddy remove <账号名|昵称|UID> [--yes] [--force] [--purge] [--json]"

@@ -156,6 +156,12 @@ ACCOUNT_MENU_ITEMS = [
         "action": "account_list",
     },
     {
+        "id": "5",
+        "name": "删除账号",
+        "desc": "移除本地已保存的账号凭证，默认移入回收站",
+        "action": "account_remove",
+    },
+    {
         "id": "0",
         "name": "返回上级",
         "desc": "返回工具箱主菜单",
@@ -406,6 +412,9 @@ class InteractiveToolController:
                 show_status = self.context.get("show_status")
                 if show_status:
                     show_status(as_json=False)
+            elif action_key == "account_remove":
+                self.action_history.append("删除账号")
+                self._handle_account_remove()
             elif action_key == "do_checkin":
                 self.action_history.append("每日签到")
                 run_checkin = self.context.get("run_checkin")
@@ -508,6 +517,91 @@ class InteractiveToolController:
             run_login(alias=alias, auto_switch=True, force=False)
         except (KeyboardInterrupt, EOFError):
             print("\n已取消录入。")
+
+    def _handle_account_remove(self):
+        """删除已保存账号：选号 -> 二次确认 -> 交底层移入回收站"""
+        get_profiles = self.context.get("get_profiles")
+        get_active_account = self.context.get("get_active_account")
+        remove_profile = self.context.get("remove_profile")
+
+        if not remove_profile:
+            print(f"{COLOR_RED}未挂载删除引擎。{COLOR_RESET}")
+            return
+
+        profiles = get_profiles() if get_profiles else {}
+        if not profiles:
+            print(f"{COLOR_RED}本地没有已保存的账号凭证，无需删除。{COLOR_RESET}")
+            return
+
+        active_data = get_active_account() if get_active_account else None
+        active_acc = active_data.get("account") if isinstance(active_data, dict) else None
+        active_uid = active_acc.get("uid") if isinstance(active_acc, dict) else None
+
+        keys = list(profiles.keys())
+        print(f"\n{COLOR_BOLD}请选择要删除的账号:{COLOR_RESET}")
+        for idx, name in enumerate(keys, 1):
+            p = profiles[name]
+            is_cur = bool(active_uid) and p.get("uid") == active_uid
+            cur_mark = f" {COLOR_YELLOW}(当前使用中){COLOR_RESET}" if is_cur else ""
+            print(f"  [{idx}] {name:<12} (昵称: {p.get('nickname')}){cur_mark}")
+        print("  [0] 返回上级")
+
+        try:
+            choice = input(f"{COLOR_BOLD}请输入账号序号 [1-{len(keys)}]: {COLOR_RESET}").strip()
+        except (KeyboardInterrupt, EOFError):
+            return
+        if choice in ("0", "q", "exit", ""):
+            return
+        try:
+            idx = int(choice)
+        except ValueError:
+            print(f"{COLOR_RED}请输入正确的数字。{COLOR_RESET}")
+            return
+        if not 1 <= idx <= len(keys):
+            print(f"{COLOR_RED}无效的序号。{COLOR_RESET}")
+            return
+
+        alias = keys[idx - 1]
+        target = profiles[alias]
+        is_active = bool(active_uid) and target.get("uid") == active_uid
+
+        try:
+            confirm = input(
+                f"{COLOR_YELLOW}确认删除账号 '{alias}' ({target.get('nickname')})？"
+                f"凭证将移入回收站 [y/N]: {COLOR_RESET}"
+            ).strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            return
+        if confirm not in ("y", "yes"):
+            print("已取消删除。")
+            return
+
+        force = False
+        if is_active:
+            try:
+                second = input(
+                    f"{COLOR_RED}该账号是当前使用中的账号，删除后本地不再保留备份，"
+                    f"切走后只能重新扫码登录。仍要删除？[y/N]: {COLOR_RESET}"
+                ).strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                return
+            if second not in ("y", "yes"):
+                print("已取消删除。")
+                return
+            force = True
+
+        res = remove_profile(alias, yes=True, force=force, quiet=True)
+        if not isinstance(res, dict):
+            return
+        if res.get("ok"):
+            remaining = len(get_profiles()) if get_profiles else 0
+            print(f"{COLOR_GREEN}✔ 已删除账号 '{alias}'，剩余 {remaining} 个已存账号。{COLOR_RESET}")
+            if res.get("trash_path"):
+                print(f"{COLOR_DIM}回收站路径: {res.get('trash_path')}{COLOR_RESET}")
+            if is_active:
+                print(f"{COLOR_YELLOW}注意: 客户端仍保持当前登录，但本地备份已移除。{COLOR_RESET}")
+        else:
+            print(f"{COLOR_RED}删除未完成: {res.get('message')}{COLOR_RESET}")
 
     def render_exit_summary(self):
         """退出时打印会话聚合审计报告 (Rule 13)"""

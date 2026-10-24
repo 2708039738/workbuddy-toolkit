@@ -1527,6 +1527,163 @@ class TestWorkBuddyCore(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError):
                 workbuddy.robust_urlopen(req, timeout=5)
 
+    def _write_profile(self, alias, uid, nickname="Nick", token="tok"):
+        """写入一份最小可解析的 Profile 测试文件"""
+        path = os.path.join(workbuddy.PROFILES_DIR, f"{alias}.info")
+        os.makedirs(workbuddy.PROFILES_DIR, exist_ok=True)
+        payload = {
+            "account": {"uid": uid, "nickname": nickname},
+            "auth": {"accessToken": token, "expiresAt": 1800000000000, "refreshExpiresAt": 1900000000000},
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        return path
+
+    def test_t54_remove_profile_trashes_file_and_clears_audit_cache(self):
+        """T54: 删除账号默认移入回收站，并从 Profile 列表与审计缓存中消失"""
+        import io
+
+        keep_path = self._write_profile("keep", "uid-keep", "Keep")
+        drop_path = self._write_profile("drop", "uid-drop", "Drop")
+        self.assertIn("drop", workbuddy.get_profiles())
+        workbuddy.save_audit_cache({"uid-drop": {"status": "HEALTHY"}, "uid-keep": {"status": "HEALTHY"}})
+
+        with patch("sys.stdout", io.StringIO()):
+            res = workbuddy.remove_profile("drop", yes=True)
+
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["action"], "trashed")
+        self.assertFalse(os.path.exists(drop_path))
+        self.assertNotIn("drop", workbuddy.get_profiles())
+        self.assertIn("keep", workbuddy.get_profiles())
+        self.assertTrue(os.path.exists(keep_path))
+        self.assertTrue(os.path.exists(res["trash_path"]))
+        self.assertEqual(os.path.dirname(res["trash_path"]), workbuddy.get_profiles_trash_dir())
+        # 回收站与 auth_profiles 同级，且不会被 get_profiles() 扫到
+        self.assertNotEqual(os.path.dirname(res["trash_path"]), workbuddy.PROFILES_DIR)
+
+        cache = workbuddy.get_audit_cache()
+        self.assertNotIn("uid-drop", cache)
+        self.assertIn("uid-keep", cache)
+
+    def test_t55_remove_profile_refuses_active_account_without_force(self):
+        """T55: 当前活跃账号默认拒绝删除，加 --force 才执行，且不破坏客户端登录态"""
+        import io
+
+        with open(workbuddy.AUTH_FILE, "w", encoding="utf-8") as f:
+            json.dump({"account": {"uid": "uid-cur", "nickname": "Cur"},
+                       "auth": {"accessToken": "tok_cur", "expiresAt": 1800000000000}}, f)
+        self._write_profile("cur", "uid-cur", "Cur")
+
+        with patch("sys.stdout", io.StringIO()):
+            refused = workbuddy.remove_profile("cur", yes=True)
+        self.assertFalse(refused["ok"])
+        self.assertEqual(refused["action"], "refused_active")
+        self.assertTrue(refused["was_active"])
+        self.assertIn("cur", workbuddy.get_profiles())
+
+        with patch("sys.stdout", io.StringIO()):
+            forced = workbuddy.remove_profile("cur", yes=True, force=True)
+        self.assertTrue(forced["ok"])
+        self.assertNotIn("cur", workbuddy.get_profiles())
+        # 删除本地备份不等于退出登录：AUTH_FILE 保持原样
+        self.assertEqual(workbuddy.get_active_account()["account"]["uid"], "uid-cur")
+
+    def test_t56_remove_profile_requires_explicit_yes_when_non_interactive(self):
+        """T56: 非交互式环境必须 --yes；交互式回答 n 取消、y 才执行"""
+        import io
+
+        path = self._write_profile("cron", "uid-cron", "Cron")
+
+        # 1. 管道 / cron：无 --yes 直接拒绝
+        with patch("sys.stdin", io.StringIO("")):
+            with patch("sys.stdout", io.StringIO()):
+                res = workbuddy.remove_profile("cron")
+        self.assertEqual(res["action"], "refused_non_interactive")
+        self.assertFalse(res["ok"])
+        self.assertTrue(os.path.exists(path))
+
+        class _TTY(io.StringIO):
+            def isatty(self):
+                return True
+
+        # 2. 交互式回答 n：取消，文件保留
+        with patch("sys.stdin", _TTY("n\n")):
+            with patch("sys.stdout", io.StringIO()):
+                cancelled = workbuddy.remove_profile("cron")
+        self.assertEqual(cancelled["action"], "cancelled")
+        self.assertTrue(os.path.exists(path))
+
+        # 3. 交互式回答 y：真正删除
+        with patch("sys.stdin", _TTY("y\n")):
+            with patch("sys.stdout", io.StringIO()):
+                done = workbuddy.remove_profile("cron")
+        self.assertTrue(done["ok"])
+        self.assertFalse(os.path.exists(path))
+
+    def test_t57_remove_profile_purge_not_found_and_ambiguous(self):
+        """T57: 无匹配 / 昵称歧义拒绝猜测；--purge 直接抹除且不产生回收站副本"""
+        import io
+
+        p1 = self._write_profile("dup_a", "uid-dup-aaaa", "Dup")
+        p2 = self._write_profile("dup_b", "uid-dup-bbbb", "Dup")
+
+        with patch("sys.stdout", io.StringIO()):
+            missing = workbuddy.remove_profile("不存在的账号", yes=True)
+        self.assertEqual(missing["action"], "not_found")
+        self.assertFalse(missing["ok"])
+
+        # 昵称命中多个不同 UID：拒绝猜测，两份都保留
+        with patch("sys.stdout", io.StringIO()):
+            ambiguous = workbuddy.remove_profile("Dup", yes=True)
+        self.assertFalse(ambiguous["ok"])
+        self.assertTrue(os.path.exists(p1))
+        self.assertTrue(os.path.exists(p2))
+
+        with patch("sys.stdout", io.StringIO()):
+            purged = workbuddy.remove_profile("dup_a", yes=True, purge=True)
+        self.assertTrue(purged["ok"])
+        self.assertEqual(purged["action"], "purged")
+        self.assertFalse(os.path.exists(p1))
+        self.assertIsNone(purged["trash_path"])
+        trash = workbuddy.get_profiles_trash_dir()
+        leftovers = os.listdir(trash) if os.path.isdir(trash) else []
+        self.assertEqual([n for n in leftovers if n.startswith("dup_a")], [])
+
+    def test_t58_cli_remove_command_and_alias(self):
+        """T58: workbuddy remove / wb-remove 分发、退出码与帮助输出"""
+        import io
+
+        path = self._write_profile("cliacc", "uid-cli", "CliAcc")
+
+        buf = io.StringIO()
+        with patch("sys.stdin", io.StringIO("")):
+            with patch("sys.stdout", buf):
+                with patch("sys.argv", ["workbuddy", "remove", "cliacc", "--yes"]):
+                    with self.assertRaises(SystemExit) as ctx:
+                        workbuddy.main()
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertFalse(os.path.exists(path))
+        self.assertIn("已删除账号", buf.getvalue())
+
+        # 别名入口打印用法
+        buf2 = io.StringIO()
+        with patch("sys.stdout", buf2):
+            with patch("sys.argv", ["wb-remove", "--help"]):
+                with self.assertRaises(SystemExit) as ctx2:
+                    workbuddy.main()
+        self.assertEqual(ctx2.exception.code, 0)
+        self.assertIn("workbuddy remove", buf2.getvalue())
+
+        # 缺少账号名：退出码 2，且不动任何文件
+        other = self._write_profile("untouched", "uid-untouched", "Untouched")
+        with patch("sys.stdout", io.StringIO()):
+            with patch("sys.argv", ["workbuddy", "remove"]):
+                with self.assertRaises(SystemExit) as ctx3:
+                    workbuddy.main()
+        self.assertEqual(ctx3.exception.code, 2)
+        self.assertTrue(os.path.exists(other))
+
 if __name__ == "__main__":
     unittest.main()
 

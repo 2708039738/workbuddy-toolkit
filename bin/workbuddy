@@ -2334,6 +2334,143 @@ def switch_to_profile(target_name, auto_restart=True, check_health=True):
         print(f"{COLOR_YELLOW}提示: 请在 WorkBuddy 窗口中刷新或重启客户端以加载新账号。{COLOR_RESET}")
     return True
 
+def get_profiles_trash_dir():
+    """删除账号时的回收站目录，与 auth_profiles 同级。
+
+    刻意不放进 PROFILES_DIR：get_profiles() 会扫描该目录下所有 *.info，
+    放在里面会让"已删除"的账号重新出现在 list / switch 候选里。
+    """
+    return os.path.join(os.path.dirname(os.path.abspath(PROFILES_DIR)), "auth_profiles_trash")
+
+def remove_profile(target_name, yes=False, force=False, purge=False, as_json=False, quiet=False):
+    """删除本地已保存的账号凭证（Profile），默认移入回收站而非直接抹除。
+
+    安全约束：
+    1. 目标必须唯一解析（别名 > 昵称 > UID > UID 前缀），有歧义时拒绝猜测；
+    2. 删除当前活跃账号必须显式 force，避免"删完才发现切不回去"；
+    3. 非交互式环境（管道 / cron / 定时任务）必须显式 yes，避免脚本误删；
+    4. 默认 shutil.move 到 auth_profiles_trash/，purge=True 才物理删除；
+    5. 同一 UID 已无其他 Profile 时顺带清掉审计缓存，避免 status/audit 继续显示已删除账号。
+
+    返回 dict: ok / alias / uid / nickname / action / was_active / trash_path / message，
+    action 取值: trashed | purged | not_found | refused_active | refused_non_interactive |
+                 cancelled | error
+    """
+    result = {
+        "ok": False,
+        "alias": None,
+        "uid": None,
+        "nickname": None,
+        "action": "not_found",
+        "was_active": False,
+        "trash_path": None,
+        "message": "",
+    }
+
+    def _finish(message, lines=None):
+        result["message"] = message
+        if quiet:
+            return result
+        if as_json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return result
+        for line in (lines or [message]):
+            print(line)
+        return result
+
+    profiles = get_profiles()
+    alias, target = resolve_profile_target(profiles, target_name, allow_uid_prefix=True, quiet=True)
+    available = ", ".join(sorted(profiles.keys())) or "(无)"
+    if not target:
+        return _finish(
+            f"未找到唯一匹配 '{target_name}' 的已保存账号。可用账号: {available}",
+            [f"{COLOR_RED}错误: 未找到唯一匹配 '{target_name}' 的已保存账号。{COLOR_RESET}",
+             f"可用账号: {available}",
+             f"提示: 用 {COLOR_BOLD}workbuddy list{COLOR_RESET} 查看完整清单（支持别名 / 昵称 / UID 前缀）。"],
+        )
+
+    uid = str(target.get("uid") or "")
+    nickname = target.get("nickname") or alias
+    result["alias"] = alias
+    result["uid"] = uid or None
+    result["nickname"] = nickname
+
+    active_data = get_active_account()
+    active_acc = active_data.get("account") if isinstance(active_data, dict) else None
+    active_uid = str(active_acc.get("uid") or "") if isinstance(active_acc, dict) else ""
+    was_active = bool(active_uid and uid and active_uid == uid)
+    result["was_active"] = was_active
+
+    if was_active and not force:
+        result["action"] = "refused_active"
+        return _finish(
+            f"'{alias}' 是当前活跃账号，删除后本地不再保留备份，只能重新扫码登录",
+            [f"{COLOR_RED}▲ '{alias}' ({nickname}) 是当前活跃账号。{COLOR_RESET}",
+             "  WorkBuddy 客户端会保持当前登录，但本地不再有该账号的备份，切走后只能重新扫码。",
+             f"  确认删除请显式加 {COLOR_BOLD}--force{COLOR_RESET}；先切到其他账号再删除更稳妥。"],
+        )
+
+    if not yes:
+        if not sys.stdin.isatty():
+            result["action"] = "refused_non_interactive"
+            return _finish(
+                "非交互式运行环境已阻止删除操作，确认删除请显式加 --yes",
+                [f"{COLOR_RED}非交互式运行环境，已阻止删除操作。{COLOR_RESET}",
+                 f"  确认删除请显式加 {COLOR_BOLD}--yes{COLOR_RESET}，例如: workbuddy remove {alias} --yes"],
+            )
+        confirm_hint = "凭证将移入回收站" if not purge else "凭证将被永久删除"
+        try:
+            ans = input(
+                f"{COLOR_YELLOW}确认删除账号 '{alias}' ({nickname})？"
+                f"{confirm_hint} [y/N]: {COLOR_RESET}"
+            ).strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            ans = ""
+        if ans not in ("y", "yes"):
+            result["action"] = "cancelled"
+            return _finish("已取消删除", ["已取消删除。"])
+
+    src_path = target.get("path") or os.path.join(PROFILES_DIR, f"{alias}.info")
+    trash_path = None
+    try:
+        if purge:
+            os.remove(src_path)
+            result["action"] = "purged"
+        else:
+            trash_dir = get_profiles_trash_dir()
+            os.makedirs(trash_dir, exist_ok=True)
+            trash_path = os.path.join(trash_dir, f"{alias}-{time.strftime('%Y%m%d-%H%M%S')}.info")
+            shutil.move(src_path, trash_path)
+            result["action"] = "trashed"
+            result["trash_path"] = trash_path
+    except OSError as e:
+        result["action"] = "error"
+        return _finish(f"删除失败: {e}", [f"{COLOR_RED}删除失败: {e}{COLOR_RESET}"])
+
+    result["ok"] = True
+
+    # 同一 UID 若已无其他 Profile，顺手清掉它的审计缓存
+    remaining = get_profiles()
+    if uid and not any(str(p.get("uid") or "") == uid for p in remaining.values()):
+        cache = get_audit_cache()
+        if uid in cache:
+            cache.pop(uid, None)
+            save_audit_cache(cache)
+
+    if purge:
+        lines = [f"{COLOR_GREEN}✔ 已永久删除账号 '{alias}' ({nickname})，凭证文件已抹除。{COLOR_RESET}"]
+        message = f"已永久删除账号 '{alias}'"
+    else:
+        lines = [f"{COLOR_GREEN}✔ 已删除账号 '{alias}' ({nickname})，凭证已移入回收站。{COLOR_RESET}",
+                 f"  回收站: {trash_path}"]
+        message = f"已删除账号 '{alias}'，凭证已移入回收站"
+    if was_active:
+        lines.append(f"{COLOR_YELLOW}  注意: 该账号是当前活跃账号，客户端仍保持登录，但本地备份已移除。{COLOR_RESET}")
+    lines.append(f"  剩余已存账号: {len(remaining)} 个")
+    if not purge:
+        lines.append(f"  误删可恢复: 把 {trash_path} 移回 {os.path.join(PROFILES_DIR, alias + '.info')}")
+    return _finish(message, lines)
+
 def send_chat_message(token, uid, prompt="请回复：你好", model=None, timeout=15):
     """
     通过底层原生 HTTP SSE 接口向指定账号发送对话，触发每日连续对话奖励。
@@ -4151,6 +4288,34 @@ def _parse_audit_cli_args(args_list):
         i += 1
     return force, daemon_mode, interval_hours
 
+def _parse_remove_cli_args(args_list):
+    """解析 remove/delete 子命令参数。返回 (target, yes, force, purge, as_json)。"""
+    yes_flag = any(a in ("--yes", "-y", "--confirm") for a in args_list)
+    force = any(a in ("--force", "-f", "--overwrite") for a in args_list)
+    purge = any(a in ("--purge",) for a in args_list)
+    as_json = any(a in ("--json", "-j") for a in args_list)
+    clean_args = [a for a in args_list if not a.startswith("-")]
+    return (clean_args[0] if clean_args else None), yes_flag, force, purge, as_json
+
+REMOVE_USAGE = "用法: workbuddy remove <账号名|昵称|UID> [--yes] [--force] [--purge] [--json]"
+
+def run_remove_cmd(args_list):
+    """`workbuddy remove` 子命令入口。返回退出码: 0 成功，1 未删除，2 参数缺失。"""
+    if any(a in ("-h", "--help", "help") for a in args_list):
+        print(REMOVE_USAGE)
+        print("  --yes    跳过确认（非交互式环境必须显式指定）")
+        print("  --force  允许删除当前活跃账号")
+        print("  --purge  直接永久删除，不保留回收站副本")
+        print("  --json   以 JSON 输出结果，便于脚本消费")
+        return 0
+    target, yes_flag, force, purge, as_json = _parse_remove_cli_args(args_list)
+    if not target:
+        print(f"{COLOR_RED}请提供要删除的账号名。{COLOR_RESET}")
+        print(REMOVE_USAGE)
+        return 2
+    res = remove_profile(target, yes=yes_flag, force=force, purge=purge, as_json=as_json)
+    return 0 if res.get("ok") else 1
+
 def run_interactive_tool_cmd(args=None):
     """启动图形化交互控制中心 (wb-tool / workbuddy tool)"""
     sidecar_dir = find_sidecar_dir()
@@ -4166,6 +4331,7 @@ def run_interactive_tool_cmd(args=None):
         "get_profiles": get_profiles,
         "switch_to_profile": switch_to_profile,
         "run_login": run_login,
+        "remove_profile": remove_profile,
         "run_audit": run_audit,
         "run_checkin": run_checkin,
         "run_models_cmd": run_models_cmd,
@@ -4193,6 +4359,7 @@ def print_help():
   workbuddy help                  查看本帮助信息 (别名: wb-help, workbuddy-help)
   workbuddy login [别名] [--force] 独立免登扫码录入 (别名: wb-login)
   workbuddy switch [账号名]        免重新扫码切换账号 (别名: wb-switch)
+  workbuddy remove <账号名> [--yes] 删除本地账号凭证 (别名: wb-remove)
   workbuddy list / status [--json] 查看账号列表与凭证状态 (别名: wb-list, wb-status)
   workbuddy audit [--daemon]      凭据健康审计与常驻巡检 (别名: wb-audit)
   workbuddy usage [选项]           积分消耗与流速统计 (别名: wb-usage)
@@ -4235,6 +4402,8 @@ def main():
         alias = clean_args[0] if clean_args else None
         run_login(alias=alias, auto_switch=auto_switch, force=force)
         return
+    if "remove" in prog_name or clean_prog in ("wb-rm", "workbuddy-rm"):
+        sys.exit(run_remove_cmd(args))
     if "audit" in prog_name:
         if any(a in ("-h", "--help", "help") for a in args):
             print("用法: wb-audit [--force] [--interval HOURS | --daemon [HOURS]]")
@@ -4359,6 +4528,8 @@ def main():
             save_current(clean_args[0], force=force)
         else:
             print(f"{COLOR_RED}请提供保存的名称，例如: workbuddy save myaccount [--force]{COLOR_RESET}")
+    elif cmd in ["remove", "rm", "delete", "del", "forget"]:
+        sys.exit(run_remove_cmd(args[1:]))
     elif cmd in ["init", "patch"]:
         init_shared_workspace()
     elif cmd in ["rollback", "unpatch"]:

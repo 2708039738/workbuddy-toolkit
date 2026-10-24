@@ -4247,6 +4247,8 @@ def _sync_memory_on_switch(target):
         res = ms.apply_account(acc, root=root)
         if res.get("action") == "unchanged":
             print(f"  [记忆] 已是最新（共享 {res.get('shared', 0)} 条）")
+        elif res.get("action") in ("skipped_encoding", "write_failed"):
+            print(f"{COLOR_YELLOW}  [记忆] 已跳过: {res.get('reason') or res.get('action')}{COLOR_RESET}")
         elif res.get("ok"):
             extra = "，新增自有 {} 条".format(res["added"]) if res.get("added") else ""
             trunc = "，{} 条因超长未展开".format(res["truncated"]) if res.get("truncated") else ""

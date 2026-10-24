@@ -274,5 +274,43 @@ class TestMemoryHubCli(unittest.TestCase):
         self.assertIn(ms.BEGIN_MARK, text)
 
 
+    def test_14_non_utf8_file_is_never_touched(self):
+        """T14: 非 UTF-8 的 MEMORY.md 必须整篇跳过，不能被当成空文件覆盖"""
+        d = ms.memory_dir(self.root, "uid-gbk")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "MEMORY.md")
+        raw = "# 记忆\n- 这条很重要：用中文回复\n".encode("gbk")
+        with open(path, "wb") as f:
+            f.write(raw)
+
+        acc = {"alias": "gbk", "uid": "uid-gbk"}
+        ms.collect([acc], root=self.root)
+        res = ms.apply_account(acc, root=self.root)
+        self.assertEqual(res["action"], "skipped_encoding")
+        self.assertTrue(res["ok"])
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), raw, "编码不认识时一个字节都不能改")
+        self.assertFalse(os.path.exists(ms.snapshot_path(self.root, "uid-gbk")))
+
+    def test_15_marker_like_text_is_not_truncated(self):
+        """T15: 用户正文里出现受管标记字样时，不能把后半篇当共享段截掉"""
+        origin = ("# 记忆\n- 第一条自有\n"
+                  "<!-- shared-memory:begin -->\n- 用户手写的说明\n"
+                  "<!-- shared-memory:end -->\n- 最后一条自有\n")
+        for uid, text in (("uid-a", origin), ("uid-b", "# 记忆\n- 乙\n")):
+            d = ms.memory_dir(self.root, uid)
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "MEMORY.md"), "w", encoding="utf-8") as f:
+                f.write(text)
+        a = {"alias": "alpha", "uid": "uid-a"}
+        b = {"alias": "beta", "uid": "uid-b"}
+        ms.collect([a, b], root=self.root)
+        ms.apply_account(a, root=self.root)
+        with open(ms.snapshot_path(self.root, "uid-a"), encoding="utf-8") as f:
+            snap = f.read()
+        for line in ("第一条自有", "用户手写的说明", "最后一条自有"):
+            self.assertIn(line, snap, "用户正文不能被误判为共享段而丢失")
+
+
 if __name__ == "__main__":
     unittest.main()

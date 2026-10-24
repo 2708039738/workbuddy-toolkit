@@ -100,6 +100,25 @@ def read_text(path):
         return ""
 
 
+def read_text_checked(path):
+    """返回 (文本, 状态)。状态: ok | missing | not_utf8 | unreadable。
+
+    非 UTF-8 必须与"空文件"区分开：把 GBK 文件当成空文件，会让基线快照被写成空、
+    随后整篇被共享内容替换——这是不可接受的数据丢失。
+    """
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return "", "missing"
+    except OSError:
+        return "", "unreadable"
+    try:
+        return raw.decode("utf-8"), "ok"
+    except UnicodeDecodeError:
+        return "", "not_utf8"
+
+
 def atomic_write_text(path, text):
     """同目录临时文件 + fsync + os.replace。客户端读记忆不做容错，不能出现半截文件。"""
     target_dir = os.path.dirname(os.path.abspath(path))
@@ -153,19 +172,43 @@ def _prune(base, keep=BACKUP_KEEP):
 # ----------------------------------------------------------------------------
 # 文本处理
 # ----------------------------------------------------------------------------
+def _managed_block_span(text):
+    """返回受管段落的 (起, 止) 行号；结构不完整则返回 None。
+
+    只认我们自己写出来的形状：起始标记独占一行 → 下一个非空行是标题 → 终止标记独占一行。
+    这样用户正文里偶尔出现 `<!-- shared-memory:begin -->` 这几个字时不会被误判成
+    "共享段开始"从而把后半篇截掉。
+    """
+    lines = text.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if line.strip() != BEGIN_MARK:
+            continue
+        j = i + 1
+        while j < len(lines) and not lines[j].strip():
+            j += 1
+        if j >= len(lines) or lines[j].strip() != SHARED_HEADER:
+            continue
+        for k in range(j, len(lines)):
+            if lines[k].strip() == END_MARK:
+                return i, k
+        return None
+    return None
+
+
 def strip_shared_block(text):
     """去掉之前注入的共享段落，只留账号自己的原文。"""
-    if not text or BEGIN_MARK not in text:
+    if not text:
         return text
-    start = text.find(BEGIN_MARK)
-    end = text.find(END_MARK)
-    if end == -1:
-        return text[:start].rstrip() + "\n"
-    return (text[:start] + text[end + len(END_MARK):]).rstrip() + "\n"
+    span = _managed_block_span(text)
+    if span is None:
+        return text
+    start, end = span
+    lines = text.splitlines(keepends=True)
+    return ("".join(lines[:start]) + "".join(lines[end + 1:])).rstrip() + "\n"
 
 
 def has_shared_block(text):
-    return bool(text) and BEGIN_MARK in text and END_MARK in text
+    return bool(text) and _managed_block_span(text) is not None
 
 
 def normalize(text):
@@ -336,12 +379,20 @@ def render(origin_text, shared_entries, limit=INJECT_LIMIT):
         body.append(line)
         used += len(line) + 1
 
+    if skipped:
+        remaining = len(shared_entries) - len(body)
+        footer = "- （另有 {} 条共享记忆未展开，超出单次注入上限）".format(remaining)
+        # 结尾提示也要算进预算：不为了写这句话而突破 4000 字上限
+        while body and used + len(footer) + 1 > limit:
+            dropped = body.pop()
+            used -= len(dropped) + 1
+            remaining += 1
+            footer = "- （另有 {} 条共享记忆未展开，超出单次注入上限）".format(remaining)
+        if used + len(footer) + 1 <= limit:
+            body.append(footer)
+
     if not body:
         return origin + "\n", 0, len(shared_entries)
-    if skipped:
-        # 只标注还有多少条没放下，不写完整清单（会二次挤占预算）
-        remaining = len(shared_entries) - len(body)
-        body.append("- （另有 {} 条共享记忆未展开，超出单次注入上限）".format(remaining))
     text = origin + "\n\n" + "\n".join(header + body + ["", END_MARK]) + "\n"
     return text, len(body), max(0, len(shared_entries) - len(body))
 
@@ -416,14 +467,21 @@ def collect(accounts, root=None):
 
     items = []
     per_account = {}
+    skipped = []
     for acc in accounts or []:
         uid = str(acc.get("uid") or "").strip()
         path = memory_file(root, uid, acc.get("enterprise_id"))
         if not path:
             continue
-        text = strip_shared_block(read_text(path))
+        raw, state = read_text_checked(path)
+        alias = acc.get("alias") or uid
+        if state == "not_utf8":
+            per_account[alias] = "跳过（非 UTF-8）"
+            skipped.append(alias)
+            continue
+        text = strip_shared_block(raw)
         lines = candidate_lines(text)
-        per_account[acc.get("alias") or uid] = len(lines)
+        per_account[alias] = len(lines)
         for line in lines:
             norm = normalize(line)
             score, _ = quality(line)
@@ -478,6 +536,7 @@ def collect(accounts, root=None):
     return {
         "ok": True,
         "accounts": per_account,
+        "skipped": skipped,
         "raw_entries": len(items),
         "entries": len(entries),
         "merged": merged,
@@ -485,12 +544,12 @@ def collect(accounts, root=None):
     }
 
 
-def _ensure_snapshot(root, uid, memory_path):
+def _ensure_snapshot(root, uid, memory_path, current_text=None):
     """首次接入时保存基线快照；已存在则原样返回，绝不覆盖。"""
     path = snapshot_path(root, uid)
     if os.path.isfile(path):
         return read_text(path)
-    current = strip_shared_block(read_text(memory_path))
+    current = strip_shared_block(current_text if current_text is not None else read_text(memory_path))
     atomic_write_text(path, current)
     return current
 
@@ -515,8 +574,14 @@ def apply_account(acc, root=None, lib=None):
         result["action"] = "no_memory_file"
         return result
 
-    current = read_text(path)
-    baseline = _ensure_snapshot(root, uid, path)
+    current, state = read_text_checked(path)
+    if state == "not_utf8":
+        # 读不了就不动：宁可这次不共享，也不能把 GBK/UTF-16 文件当空文件覆盖掉
+        result["ok"] = True
+        result["action"] = "skipped_encoding"
+        result["reason"] = "MEMORY.md 不是 UTF-8 编码，已跳过（未做任何写入）"
+        return result
+    baseline = _ensure_snapshot(root, uid, path, current_text=current)
     new_baseline, added, upgraded = absorb(baseline, strip_shared_block(current))
     if new_baseline != baseline:
         backup_file(snapshot_path(root, uid), root)
@@ -546,7 +611,13 @@ def apply_account(acc, root=None, lib=None):
         return result
 
     result["backup"] = backup_file(path, root)
-    atomic_write_text(path, rendered)
+    try:
+        atomic_write_text(path, rendered)
+    except OSError as e:
+        result["ok"] = False
+        result["action"] = "write_failed"
+        result["reason"] = str(e)
+        return result
     result["ok"] = True
     result["action"] = "created" if not has_shared_block(current) else "updated"
     return result

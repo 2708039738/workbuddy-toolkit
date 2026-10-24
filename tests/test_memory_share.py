@@ -529,6 +529,52 @@ class TestRenderRegressions(unittest.TestCase):
         self.assertEqual(res["action"], "locked")
 
 
+class TestSectionRebalance(unittest.TestCase):
+    """分节迁移：整节搬，不把列表和它的标题拆散。"""
+
+    def test_38_section_move_keeps_lists_whole(self):
+        """T38: 整节迁移不会留下孤立子项"""
+        doc = ("# MEMORY.md\n"
+               "## 一、排错\n"
+               "- 先复现\n"
+               "  - 记录完整错误\n"
+               "  - 记录版本\n"
+               "## 二、git\n"
+               "- 分支是指向提交历史的名字\n")
+        plan = ms.plan_rebalance_sections(doc, target=40)
+        self.assertEqual(plan["mode"], "section")
+        self.assertIn("## 一、排错", plan["moved_soul"])
+        self.assertIn("  - 记录版本", plan["moved_soul"], "缩进子项必须跟父节一起走")
+        self.assertNotIn("  - 记录版本", plan["kept"])
+
+    def test_39_auto_mode_prefers_sections(self):
+        """T39: 有 ≥2 个二级标题时自动走按节迁移"""
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        acc = {"alias": "alpha", "uid": "uid-a"}
+        d = ms.memory_dir(root, "uid-a")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "MEMORY.md"), "w", encoding="utf-8") as f:
+            f.write("# MEMORY.md\n"
+                    "## 一、方法论\n" + "\n".join("- 必须遵守准则 {}".format(i) for i in range(80)) + "\n"
+                    "## 二、事实\n- 项目在 D:/work/x\n")
+        res = ms.rebalance_account(acc, root=root, target=500, apply=False)
+        self.assertEqual(res["plan"]["mode"], "section")
+        self.assertTrue(res["plan"]["sections"])
+        self.assertTrue(any(s["moved"] for s in res["plan"]["sections"]))
+
+    def test_40_section_facts_stay_in_memory(self):
+        """T40: 含本机路径的节不搬——那是本机事实，不是行为准则"""
+        doc = ("# MEMORY.md\n"
+               "## 一、环境\n"
+               "- 工作区在 D:/work/app\n"
+               "- 虚拟环境在 D:/venv\n"
+               "## 二、方法\n" + "\n".join("- 必须这样做 {}".format(i) for i in range(60)) + "\n")
+        plan = ms.plan_rebalance_sections(doc, target=200)
+        self.assertIn("## 一、环境", plan["kept"])
+        self.assertNotIn("## 一、环境", plan["moved_soul"])
+
+
 class TestMemoryHubCli(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp()

@@ -4359,8 +4359,12 @@ def run_memory_cmd(args_list):
                     print(f"  {r['alias']}: 跳过（{r['action']}）")
                     continue
                 p = r.get("projected") or {}
+                mode = (r.get("plan") or {}).get("mode")
                 print(f"  {r['alias']}: MEMORY {p.get('memory_before', 0)} → {p.get('memory_after', 0)} 字"
-                      f"（上限 {ms.INJECT_LIMIT}）")
+                      f"（上限 {ms.INJECT_LIMIT}，{'按节迁移' if mode == 'section' else '按行迁移'}）")
+                for sec in (r.get("plan") or {}).get("sections") or []:
+                    print(f"    {'→ ' + ('搬走' if sec['moved'] else '留下'):<4} {sec['size']:>5} 字  "
+                          f"{sec['heading'][:46]}")
                 print(f"    搬出 SOUL {r['plan']['moved_soul']} 行"
                       f"（{p.get('soul_before', 0)} → {p.get('soul_after', 0)} / 10000）")
                 print(f"    搬出 USER {r['plan']['moved_user']} 行"

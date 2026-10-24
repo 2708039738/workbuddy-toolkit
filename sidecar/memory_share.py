@@ -764,6 +764,91 @@ def plan_rebalance(memory_text, target=3200):
     }
 
 
+SECTION_USER_KEYS = ("称呼", "叫我", "昵称", "画像", "偏好", "沟通习惯", "语言习惯")
+SECTION_FACT_KEYS = ("事实", "状态", "清单", "路径", "配置", "进度", "账号")
+
+
+def _split_sections(text):
+    """按 #/## 标题切块，标题之前的引言单独成块。块内保留原始行序。"""
+    blocks = []
+    heading = None
+    buf = []
+    for line in str(text or "").splitlines():
+        if re.match(r"^#{1,2}\s+\S", line):
+            if heading is not None or buf:
+                blocks.append((heading, buf))
+            heading, buf = line, [line]
+        else:
+            buf.append(line)
+    if heading is not None or buf:
+        blocks.append((heading, buf))
+    return blocks
+
+
+def classify_section(heading, body):
+    """按"这一节在讲什么"决定去处。
+
+    单行分类（classify_line）会把一个列表拆散：缩进子项被搬走，父标题留在原地，
+    两边都读不懂。所以文档有分节结构时先按节判断，整节一起搬。
+    """
+    head = heading or ""
+    if not head:
+        return "memory"
+    if head.startswith("# "):          # 文档标题，永远留在 MEMORY
+        return "memory"
+    if any(k in head for k in SECTION_USER_KEYS):
+        return "user"
+    if any(k in head for k in SECTION_FACT_KEYS):
+        return "memory"
+    if sum(1 for line in body if is_local_fact(line)) >= 2:
+        return "memory"
+    return "soul"
+
+
+def plan_rebalance_sections(memory_text, target=3200):
+    """按整节迁移：从最后一节往前搬，搬到 target 以下就停。
+
+    从尾部搬是为了保持文档顺序——被搬走的总是结尾的几节，
+    留在 MEMORY 里的前几节仍然读得通顺。
+    """
+    blocks = _split_sections(memory_text)
+    sizes = [sum(len(line) + 1 for line in body) for _, body in blocks]
+    kinds = [classify_section(head, body) for head, body in blocks]
+    keep = [True] * len(blocks)
+    moved = {"soul": [], "user": []}
+    remaining = sum(sizes)
+
+    if remaining > target:
+        for i in range(len(blocks) - 1, -1, -1):
+            if remaining <= target:
+                break
+            if kinds[i] == "memory":
+                continue
+            moved[kinds[i]].extend(blocks[i][1])
+            remaining -= sizes[i]
+            keep[i] = False
+
+    kept = []
+    for i, (_, body) in enumerate(blocks):
+        if keep[i]:
+            kept.extend(body)
+    return {
+        "mode": "section",
+        "lines_in": sum(len(body) for _, body in blocks),
+        "memory_lines": len(kept),
+        "memory_size": sum(len(line) + 1 for line in kept),
+        "target": target,
+        "moved_soul": [l for l in moved["soul"] if l.strip()],
+        "moved_user": [l for l in moved["user"] if l.strip()],
+        "moved_soul_size": sum(len(l) + 1 for l in moved["soul"] if l.strip()),
+        "moved_user_size": sum(len(l) + 1 for l in moved["user"] if l.strip()),
+        "sections": [{"heading": h or "（引言）", "kind": k, "size": s, "moved": not keep[i]}
+                     for i, ((h, _), k, s) in enumerate(zip(blocks, kinds, sizes))],
+        "kept": kept,
+        "overflow_before": max(0, sum(sizes) - target),
+    }
+
+
 def _render_channel_section(title, lines):
     body = "\n".join(lines)
     return "{}\n## {}\n\n{}\n{}\n".format(REBALANCE_BEGIN, title, body, REBALANCE_END)
@@ -805,7 +890,13 @@ def _rebalance_locked(acc, root, target, apply):
         result["action"] = "skipped_encoding" if state == "not_utf8" else "no_memory_file"
         return result
 
-    plan = plan_rebalance(mem_text, target=target)
+    # 有分节结构的文档按整节搬（不拆列表）；散条目的文档仍按行搬
+    blocks = _split_sections(mem_text)
+    has_sections = sum(1 for head, _ in blocks if head and head.startswith("## ")) >= 2
+    plan = (plan_rebalance_sections(mem_text, target=target) if has_sections
+            else plan_rebalance(mem_text, target=target))
+    if "mode" not in plan:
+        plan["mode"] = "line"
     soul_before = len(read_text(soul_path))
     user_before = len(read_text(user_path))
     result["projected"] = {
@@ -817,11 +908,13 @@ def _rebalance_locked(acc, root, target, apply):
         "user_after": user_before + plan["moved_user_size"],
     }
     result["plan"] = {
+        "mode": plan.get("mode"),
         "memory_size": plan["memory_size"],
         "moved_soul": len(plan["moved_soul"]),
         "moved_user": len(plan["moved_user"]),
         "moved_soul_size": plan["moved_soul_size"],
         "moved_user_size": plan["moved_user_size"],
+        "sections": plan.get("sections") or [],
         "target": target,
     }
     if not apply or (not plan["moved_soul"] and not plan["moved_user"]):

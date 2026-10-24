@@ -2348,6 +2348,293 @@ def get_profiles_trash_dir():
     """
     return os.path.join(os.path.dirname(os.path.abspath(PROFILES_DIR)), "auth_profiles_trash")
 
+def get_data_root():
+    """账号数据的根目录（与 auth_profiles 同级，实机为 ~/.workbuddy）。
+
+    测试里只要把 PROFILES_DIR 指到临时目录，账号档案、回收站就一起被隔离，
+    不会碰真实用户目录。
+    """
+    return os.path.dirname(os.path.abspath(PROFILES_DIR))
+
+def get_memory_trash_dir():
+    """人格/记忆的回收站：auth_profiles_trash/memory/，与凭证备份同根。"""
+    return os.path.join(get_profiles_trash_dir(), "memory")
+
+_ACCOUNT_UID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+
+def is_valid_account_uid(uid):
+    """UID 会被拼进文件路径，必须严格校验。
+
+    凭证文件是本地可写 JSON；若 uid 被改成 `../../x`，按 uid 拼路径就会
+    把数据根之外的目录当成"账号档案"搬走。这里只接受字母数字开头、
+    后续为字母数字/下划线/连字符的 1–64 字符。
+    """
+    return bool(isinstance(uid, str) and _ACCOUNT_UID_RE.fullmatch(uid))
+
+def _is_under(root, path):
+    """判断 path 是否真的位于 root 之内（解析符号链接后再比）。"""
+    try:
+        root_real = os.path.normcase(os.path.realpath(os.path.abspath(root)))
+        path_real = os.path.normcase(os.path.realpath(os.path.abspath(path)))
+    except (TypeError, ValueError):
+        return False
+    return path_real == root_real or path_real.startswith(root_real + os.sep)
+
+def get_account_archive_paths(uid, root=None):
+    """按客户端写账号的方向，反推该 UID 在本机留下的档案。
+
+    客户端绑定 UID 后按 `user-<uid>-<enterprise|personal>` 分目录写人格与记忆；
+    云端档案缓存在 `memory/<uid>_memory.md`；工具箱若用过记忆共享，
+    还会在 `cache/shared_memory/{originals,backups}/<uid>/` 留副本。
+
+    只按路径前缀精确匹配，不递归猜测；符号链接一律跳过，避免顺着链接
+    把数据根之外的文件搬进回收站。返回 [{kind, path, type}]。
+    """
+    items = []
+    if not is_valid_account_uid(uid):
+        return items
+    root = os.path.abspath(root or get_data_root())
+    prefix = "user-" + uid
+
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        names = []
+    for name in names:
+        if name != prefix and not name.startswith(prefix + "-"):
+            continue
+        path = os.path.join(root, name)
+        if os.path.islink(path) or not os.path.isdir(path):
+            continue
+        if _is_under(root, path):
+            items.append({"kind": "profile_dir", "path": path, "type": "dir"})
+
+    memory_dir = os.path.join(root, "memory")
+    for suffix in ("", ".bak"):
+        path = os.path.join(memory_dir, uid + "_memory.md" + suffix)
+        if os.path.islink(path) or not os.path.isfile(path):
+            continue
+        if _is_under(root, path):
+            items.append({"kind": "cloud_memory", "path": path, "type": "file"})
+
+    hub = os.path.join(root, "cache", "shared_memory")
+    for sub, kind in (("originals", "toolkit_originals"), ("backups", "toolkit_backups")):
+        path = os.path.join(hub, sub, uid)
+        if os.path.islink(path) or not os.path.isdir(path):
+            continue
+        if _is_under(root, path):
+            items.append({"kind": kind, "path": path, "type": "dir"})
+    return items
+
+_ARCHIVE_KIND_LABELS = {
+    "profile_dir": "人格与记忆目录",
+    "cloud_memory": "云端记忆档案缓存",
+    "toolkit_originals": "工具箱记忆原文快照",
+    "toolkit_backups": "工具箱记忆备份",
+}
+
+def _remove_tree(path):
+    """删除文件或目录。
+
+    刻意不用 shutil.rmtree：本机沙箱会对它做拦截，而且只读文件/被占用文件
+    需要让调用方看到失败，而不是被 ignore_errors 静默吞掉。
+    """
+    if not os.path.lexists(path):
+        return
+    if os.path.islink(path) or os.path.isfile(path):
+        os.remove(path)
+        return
+    for cur, dirs, files in os.walk(path, topdown=False):
+        for name in files:
+            target = os.path.join(cur, name)
+            try:
+                os.remove(target)
+            except FileNotFoundError:
+                pass
+        for name in dirs:
+            target = os.path.join(cur, name)
+            if os.path.islink(target):
+                os.remove(target)
+            else:
+                os.rmdir(target)
+    os.rmdir(path)
+
+def _move_path(src, dest):
+    """把文件/目录移动到 dest（dest 必须不存在）。
+
+    同卷优先 os.replace（原子）；跨卷退回复制后删除。复制时保留符号链接本身，
+    不跟随链接把外部内容拷进来。
+    """
+    try:
+        os.replace(src, dest)
+        return
+    except OSError:
+        pass
+    if os.path.isdir(src) and not os.path.islink(src):
+        shutil.copytree(src, dest, symlinks=True)
+        _remove_tree(src)
+    else:
+        shutil.copy2(src, dest, follow_symlinks=False)
+        os.remove(src)
+
+_ARCHIVE_MANIFEST = "manifest.json"
+
+def _read_archive_manifest(bundle):
+    path = os.path.join(bundle, _ARCHIVE_MANIFEST)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+def archive_account_memory(uid, alias, stem, purge=False):
+    """把该 UID 的人格/记忆移入回收站，purge=True 时再彻底抹除。
+
+    返回 action:
+      none               没有找到档案（账号从未在本机登录过 / 已被清理）
+      trashed            已移入 auth_profiles_trash/memory/<stem>/
+      purged             已彻底删除
+      skipped_invalid_uid UID 缺失或含路径成分，拒绝清理
+      error              移动失败，已回滚，凭证不受影响
+    """
+    result = {"action": "none", "bundle": None, "items": [], "message": ""}
+    if not uid:
+        result["action"] = "skipped_invalid_uid"
+        result["message"] = "凭证没有 UID，无法定位账号档案"
+        return result
+    if not is_valid_account_uid(uid):
+        result["action"] = "skipped_invalid_uid"
+        result["message"] = "UID 含路径成分，拒绝据此清理账号档案"
+        return result
+
+    items = get_account_archive_paths(uid)
+    if not items:
+        result["message"] = "未发现该账号的人格/记忆档案"
+        return result
+
+    bundle = os.path.join(get_memory_trash_dir(), stem)
+    files_dir = os.path.join(bundle, "files")
+    manifest_items = []
+    moved = []
+    try:
+        os.makedirs(files_dir, exist_ok=True)
+        for idx, item in enumerate(items):
+            dest = os.path.join(files_dir, "{}-{}".format(idx, os.path.basename(item["path"])))
+            _move_path(item["path"], dest)
+            moved.append((dest, item["path"]))
+            manifest_items.append({
+                "kind": item["kind"],
+                "type": item["type"],
+                "src": item["path"],
+                "rel": os.path.relpath(dest, bundle),
+            })
+        atomic_write_json(os.path.join(bundle, _ARCHIVE_MANIFEST), {
+            "version": 1,
+            "uid": uid,
+            "alias": alias,
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "items": manifest_items,
+        })
+    except OSError as e:
+        # 搬到一半失败：把已搬的放回原处，避免账号"少了一部分人格"
+        for dest, src in reversed(moved):
+            try:
+                _move_path(dest, src)
+            except OSError:
+                pass
+        try:
+            _remove_tree(bundle)
+        except OSError:
+            pass
+        result["action"] = "error"
+        result["message"] = "账号档案移动失败: {}".format(e)
+        return result
+
+    result["bundle"] = bundle
+    result["items"] = [{"kind": it["kind"], "path": it["path"]} for it in items]
+
+    if not purge:
+        result["action"] = "trashed"
+        result["message"] = "账号人格/记忆已移入回收站"
+        return result
+
+    try:
+        _remove_tree(bundle)
+    except OSError as e:
+        result["action"] = "trashed"
+        result["message"] = "账号档案已移入回收站，但彻底删除失败: {}".format(e)
+        return result
+    result["action"] = "purged"
+    result["bundle"] = None
+    result["message"] = "账号人格/记忆已彻底删除"
+    return result
+
+def restore_account_memory(stem):
+    """把 <stem> 对应的记忆归档还原回原路径。
+
+    已存在的目标一律不覆盖：宁可留下归档让用户自己处理，也不能用旧记忆
+    盖掉账号重新登录后产生的新记忆。
+    """
+    result = {"action": "none", "restored": [], "skipped": [], "bundle": None, "message": ""}
+    bundle = os.path.join(get_memory_trash_dir(), stem)
+    if not os.path.isdir(bundle):
+        return result
+    result["bundle"] = bundle
+
+    manifest = _read_archive_manifest(bundle)
+    if not manifest or not isinstance(manifest.get("items"), list):
+        result["action"] = "error"
+        result["message"] = "记忆归档缺少可读清单，已保留不还原"
+        return result
+
+    root = get_data_root()
+    remaining = []
+    for item in manifest["items"]:
+        if not isinstance(item, dict):
+            continue
+        src = str(item.get("src") or "")
+        rel = str(item.get("rel") or "")
+        parts = rel.replace("\\", "/").split("/")
+        if not src or not rel or os.path.isabs(rel) or ".." in parts:
+            result["skipped"].append({"src": src, "reason": "清单路径非法"})
+            remaining.append(item)
+            continue
+        if not _is_under(root, src):
+            result["skipped"].append({"src": src, "reason": "目标不在账号数据目录内"})
+            remaining.append(item)
+            continue
+        staged = os.path.join(bundle, rel)
+        if not os.path.lexists(staged):
+            result["skipped"].append({"src": src, "reason": "归档文件缺失"})
+            continue
+        if os.path.lexists(src):
+            result["skipped"].append({"src": src, "reason": "目标已存在，不覆盖"})
+            remaining.append(item)
+            continue
+        try:
+            os.makedirs(os.path.dirname(src), exist_ok=True)
+            _move_path(staged, src)
+        except OSError as e:
+            result["skipped"].append({"src": src, "reason": str(e)})
+            remaining.append(item)
+            continue
+        result["restored"].append(src)
+
+    if remaining:
+        result["action"] = "partial" if result["restored"] else "skipped"
+        result["message"] = "部分档案未还原，归档已保留"
+        return result
+    try:
+        _remove_tree(bundle)
+    except OSError as e:
+        result["action"] = "restored"
+        result["message"] = "档案已还原，但空归档清理失败: {}".format(e)
+        return result
+    result["action"] = "restored"
+    result["message"] = "账号人格/记忆已还原"
+    return result
+
 def _reserve_trash_path(trash_dir, alias):
     """用 O_CREAT|O_EXCL 独占创建回收站文件名，返回已占位的路径。
 
@@ -2474,23 +2761,45 @@ def restore_from_trash(name, yes=False, force=False, as_json=False):
 
     result["ok"] = True
     result["action"] = "restored"
-    return _finish(
-        f"已还原账号 '{alias}'",
-        [f"{COLOR_GREEN}✔ 已还原账号 '{alias}' -> {dest}{COLOR_RESET}"],
-    )
 
-def remove_profile(target_name, yes=False, force=False, purge=False, as_json=False, quiet=False):
+    # 凭证与记忆用同一个 stem 配对；有归档就一起还原，避免"账号回来了但记忆是空的"
+    stem = clean[:-5] if clean.endswith(".info") else clean
+    mem = restore_account_memory(stem)
+    result["memory_action"] = mem.get("action", "none")
+    result["memory_restored"] = mem.get("restored", [])
+    result["memory_skipped"] = mem.get("skipped", [])
+    result["memory_bundle"] = mem.get("bundle")
+
+    lines = [f"{COLOR_GREEN}✔ 已还原账号 '{alias}' -> {dest}{COLOR_RESET}"]
+    if mem.get("action") == "restored":
+        lines.append(f"{COLOR_GREEN}✔ 人格/记忆已一并还原（{len(mem.get('restored') or [])} 项）{COLOR_RESET}")
+    elif mem.get("action") == "partial":
+        lines.append(f"{COLOR_YELLOW}▲ 人格/记忆部分还原，剩余归档保留在 {mem.get('bundle')}{COLOR_RESET}")
+        for item in (mem.get("skipped") or [])[:3]:
+            lines.append(f"  - 跳过 {item.get('src')}: {item.get('reason')}")
+    elif mem.get("action") == "error":
+        lines.append(f"{COLOR_YELLOW}▲ 凭证已还原，但记忆归档无法读取: {mem.get('message')}{COLOR_RESET}")
+    elif mem.get("action") == "none":
+        lines.append(f"  （该备份没有配对的记忆归档，只还原了凭证）")
+    return _finish(f"已还原账号 '{alias}'", lines)
+
+def remove_profile(target_name, yes=False, force=False, purge=False, purge_memory=False,
+                   as_json=False, quiet=False):
     """删除本地已保存的账号凭证（Profile），默认移入回收站而非直接抹除。
 
     安全约束：
     1. 目标必须唯一解析（别名 > 昵称 > UID > UID 前缀），有歧义时拒绝猜测；
     2. 删除当前活跃账号必须显式 force，避免"删完才发现切不回去"；
     3. 非交互式环境（管道 / cron / 定时任务）必须显式 yes，避免脚本误删；
-    4. 默认 shutil.move 到 auth_profiles_trash/，purge=True 才物理删除；
-    5. 同一 UID 已无其他 Profile 时顺带清掉审计缓存，避免 status/audit 继续显示已删除账号。
+    4. 默认移到 auth_profiles_trash/，purge=True 才物理删除；
+    5. 同一 UID 已无其他 Profile 时顺带清掉审计缓存，避免 status/audit 继续显示已删除账号；
+    6. purge_memory=True 时，把客户端按 UID 写下的 `user-<uid>-*/`、`memory/<uid>_memory.md`
+       与工具箱记忆副本一并移入回收站；同 UID 还有其他 Profile 时默认拒绝，避免误伤。
 
-    返回 dict: ok / alias / uid / nickname / action / was_active / trash_path / message，
+    返回 dict: ok / alias / uid / nickname / action / was_active / trash_path /
+    memory_action / memory_bundle / memory_items / memory_kept / message，
     action 取值: trashed | purged | not_found | refused_active | refused_non_interactive |
+                 refused_unparsable | refused_active_unknown | refused_shared_uid |
                  cancelled | error
     """
     result = {
@@ -2503,6 +2812,10 @@ def remove_profile(target_name, yes=False, force=False, purge=False, as_json=Fal
         "active_unknown": False,
         "unparsable": False,
         "trash_path": None,
+        "memory_action": "not_requested",
+        "memory_bundle": None,
+        "memory_items": [],
+        "memory_kept": [],
         "message": "",
     }
 
@@ -2596,6 +2909,38 @@ def remove_profile(target_name, yes=False, force=False, purge=False, as_json=Fal
              f"确认要删再加 {COLOR_BOLD}--force{COLOR_RESET}。"],
         )
 
+    if purge_memory and not is_valid_account_uid(uid):
+        result["action"] = "refused_memory_unknown_uid"
+        return _finish(
+            "无法定位该账号的人格/记忆目录：凭证里没有可用的 UID",
+            [f"{COLOR_RED}▲ 无法定位 '{alias}' 的人格/记忆目录。{COLOR_RESET}",
+             "  客户端按 UID 分目录存放记忆；凭证里没有合法 UID 时，清理记忆只能靠猜，",
+             "  而猜错会删掉别的账号。",
+             f"  只删凭证请去掉 {COLOR_BOLD}--purge-memory{COLOR_RESET}；"
+             f"或先修复凭证（重新扫码登录同名账号）再重试。"],
+        )
+
+    # 同一个 UID 可能保存了多份 Profile（同账号不同别名）。删掉其中一份却清空 UID 的
+    # 记忆，会让仍在列表里的那份账号"登录后记忆全空"，因此默认拒绝。
+    same_uid_others = []
+    if uid:
+        same_uid_others = [n for n, p in profiles.items()
+                           if n != alias and str(p.get("uid") or "") == uid]
+    archive_paths = get_account_archive_paths(uid) if uid else []
+    result["memory_kept"] = [it["path"] for it in archive_paths]
+
+    if purge_memory and same_uid_others and not force:
+        result["action"] = "refused_shared_uid"
+        result["memory_action"] = "refused_shared"
+        return _finish(
+            f"同一个 UID 还有 {len(same_uid_others)} 个账号配置在用，不能只清其中一个的记忆",
+            [f"{COLOR_RED}▲ 同一个 UID 还有 {len(same_uid_others)} 个 Profile: "
+             f"{', '.join(same_uid_others)}{COLOR_RESET}",
+             "  记忆目录按 UID 共享；清掉后其余 Profile 仍能登录，但人格与记忆会变成空。",
+             f"  确认要一并清空该 UID 的记忆请加 {COLOR_BOLD}--force{COLOR_RESET}；"
+             f"或先删掉其余同名配置。"],
+        )
+
     if not yes:
         if not sys.stdin.isatty():
             result["action"] = "refused_non_interactive"
@@ -2617,33 +2962,73 @@ def remove_profile(target_name, yes=False, force=False, purge=False, as_json=Fal
             return _finish("已取消删除", ["已取消删除。"])
 
     src_path = target.get("path") or os.path.join(PROFILES_DIR, f"{alias}.info")
-    trash_path = None
+    trash_dir = get_profiles_trash_dir()
     try:
-        if purge:
-            os.remove(src_path)
-            result["action"] = "purged"
-        else:
-            trash_dir = get_profiles_trash_dir()
-            os.makedirs(trash_dir, exist_ok=True)
-            # 冲突时不能靠 exists() 判断（TOCTOU），用 O_EXCL 独占占位再原子替换
-            trash_path = _reserve_trash_path(trash_dir, alias)
+        os.makedirs(trash_dir, exist_ok=True)
+        # 无论是否 --purge，都先落到回收站：所有搬运成功后再抹除。
+        # 这样任何一步失败都还有可恢复的副本，不会出现"凭证没了、记忆还在"或反之。
+        trash_path = _reserve_trash_path(trash_dir, alias)
+        try:
+            _move_path(src_path, trash_path)
+        except OSError:
             try:
-                try:
-                    os.replace(src_path, trash_path)
-                except OSError:
-                    # 跨卷等场景回退到 move；此时文件名已被独占，不会被别人覆盖
-                    shutil.move(src_path, trash_path)
+                os.remove(trash_path)
             except OSError:
-                try:
-                    os.remove(trash_path)
-                except OSError:
-                    pass
-                raise
-            result["action"] = "trashed"
-            result["trash_path"] = trash_path
+                pass
+            raise
     except OSError as e:
         result["action"] = "error"
         return _finish(f"删除失败: {e}", [f"{COLOR_RED}删除失败: {e}{COLOR_RESET}"])
+
+    result["trash_path"] = trash_path
+    stem = os.path.basename(trash_path)
+    if stem.endswith(".info"):
+        stem = stem[:-5]
+
+    # 凭证已经安全落袋，再动账号档案；档案搬运失败就把凭证放回原处，整体回滚
+    if purge_memory:
+        mem = archive_account_memory(uid, alias, stem, purge=False)
+        result["memory_action"] = mem.get("action", "none")
+        result["memory_bundle"] = mem.get("bundle")
+        result["memory_items"] = mem.get("items") or []
+        result["memory_kept"] = []
+        if mem.get("action") == "error":
+            try:
+                _move_path(trash_path, src_path)
+            except OSError:
+                pass
+            result["action"] = "error"
+            return _finish(
+                f"删除失败: {mem.get('message')}；凭证已放回原处",
+                [f"{COLOR_RED}删除失败: {mem.get('message')}{COLOR_RESET}",
+                 f"  凭证已放回: {src_path}"],
+            )
+    else:
+        result["memory_action"] = "not_requested"
+
+    if purge:
+        try:
+            os.remove(trash_path)
+        except OSError as e:
+            result["action"] = "purge_failed"
+            return _finish(
+                f"凭证已移入回收站，但未能彻底抹除: {e}",
+                [f"{COLOR_RED}▲ 凭证已移入回收站，但未能彻底抹除: {e}{COLOR_RESET}",
+                 f"  回收站: {trash_path}",
+                 "  可稍后重试，或手工删除该文件。"],
+            )
+        result["trash_path"] = None
+        result["action"] = "purged"
+        if result["memory_action"] == "trashed":
+            try:
+                _remove_tree(result["memory_bundle"])
+            except OSError:
+                result["memory_action"] = "purge_failed"
+            else:
+                result["memory_action"] = "purged"
+                result["memory_bundle"] = None
+    else:
+        result["action"] = "trashed"
 
     result["ok"] = True
 
@@ -2655,20 +3040,44 @@ def remove_profile(target_name, yes=False, force=False, purge=False, as_json=Fal
             cache.pop(uid, None)
             save_audit_cache(cache)
 
-    if purge:
+    if result["action"] == "purged":
         lines = [f"{COLOR_GREEN}✔ 已永久删除账号 '{alias}' ({nickname})，凭证文件已抹除。{COLOR_RESET}"]
         message = f"已永久删除账号 '{alias}'"
     else:
         lines = [f"{COLOR_GREEN}✔ 已删除账号 '{alias}' ({nickname})，凭证已移入回收站。{COLOR_RESET}",
                  f"  回收站: {trash_path}"]
         message = f"已删除账号 '{alias}'，凭证已移入回收站"
+
+    mem_action = result.get("memory_action")
+    if mem_action == "trashed":
+        lines.append(f"{COLOR_GREEN}✔ 人格/记忆已移入回收站: {result.get('memory_bundle')}{COLOR_RESET}")
+        lines.append(f"  恢复时用 --restore 会把凭证与记忆一起还原。")
+    elif mem_action == "purged":
+        lines.append(f"{COLOR_GREEN}✔ 该账号的人格/记忆已彻底删除。{COLOR_RESET}")
+    elif mem_action == "purge_failed":
+        lines.append(f"{COLOR_YELLOW}▲ 凭证已抹除，但人格/记忆归档未能彻底删除: "
+                     f"{result.get('memory_bundle')}{COLOR_RESET}")
+    elif mem_action == "none":
+        lines.append(f"  未发现该账号的人格/记忆档案，无需清理。")
+    elif mem_action == "skipped_invalid_uid":
+        lines.append(f"{COLOR_YELLOW}▲ 凭证缺少合法 UID，未清理人格/记忆。{COLOR_RESET}")
+    elif mem_action == "not_requested" and archive_paths:
+        lines.append(f"{COLOR_YELLOW}  人格/记忆未删除，仍保留在:{COLOR_RESET}")
+        for item in archive_paths:
+            label = _ARCHIVE_KIND_LABELS.get(item["kind"], item["kind"])
+            lines.append(f"    - {item['path']} ({label})")
+        lines.append(f"  彻底清理请加 {COLOR_BOLD}--purge-memory{COLOR_RESET}"
+                     f"（默认移入回收站，配合 --purge 一并抹除）。")
+
     if was_active:
         lines.append(f"{COLOR_YELLOW}  注意: 该账号是当前活跃账号，客户端仍保持登录，但本地备份已移除。{COLOR_RESET}")
+        if purge_memory and mem_action in ("trashed", "purged"):
+            lines.append(f"{COLOR_YELLOW}  客户端仍在运行，可能重新创建记忆目录；建议退出客户端后再清理。{COLOR_RESET}")
     if unparsable:
         lines.append(f"{COLOR_YELLOW}  注意: 该凭证文件无法解析，身份未经校验，仅按文件名删除。{COLOR_RESET}")
     lines.append(f"  剩余已存账号: {len(remaining)} 个")
-    if not purge:
-        lines.append(f"  误删可恢复: 把 {trash_path} 移回 {os.path.join(PROFILES_DIR, alias + '.info')}")
+    if result["action"] == "trashed":
+        lines.append(f"  误删可恢复: workbuddy remove --restore {os.path.basename(trash_path)}")
     return _finish(message, lines)
 
 def send_chat_message(token, uid, prompt="请回复：你好", model=None, timeout=15):
@@ -4494,13 +4903,14 @@ REMOVE_BOOL_FLAGS = {
     "--yes": "yes", "-y": "yes", "--confirm": "yes",
     "--force": "force",
     "--purge": "purge",
+    "--purge-memory": "purge_memory",
     "--json": "json", "-j": "json",
     "--list-trash": "list_trash",
 }
 
 REMOVE_USAGE = (
     "用法:\n"
-    "  workbuddy remove <账号名|昵称|UID> [--yes] [--force] [--purge] [--json]\n"
+    "  workbuddy remove <账号名|昵称|UID> [--yes] [--force] [--purge] [--purge-memory] [--json]\n"
     "  workbuddy remove --list-trash [--json]\n"
     "  workbuddy remove --restore <回收站文件名> [--yes] [--force] [--json]"
 )
@@ -4516,7 +4926,8 @@ def _parse_remove_cli_args(args_list):
     - 多于一个目标直接报错，避免 `remove a b` 静默只处理 a；
     - `--` 之后一律按位置参数处理，用来支持 `-weird` 这类连字符开头的别名。
     """
-    opts = {"yes": False, "force": False, "purge": False, "json": False, "list_trash": False}
+    opts = {"yes": False, "force": False, "purge": False, "purge_memory": False,
+            "json": False, "list_trash": False}
     restore = None
     positionals = []
     i = 0
@@ -4541,12 +4952,13 @@ def _parse_remove_cli_args(args_list):
         i += 1
 
     if opts["list_trash"]:
-        if restore or positionals or opts["purge"]:
-            raise RemoveArgsError("--list-trash 不能与账号名 / --restore / --purge 同时使用")
+        if restore or positionals or opts["purge"] or opts["purge_memory"]:
+            raise RemoveArgsError(
+                "--list-trash 不能与账号名 / --restore / --purge / --purge-memory 同时使用")
         return {"mode": "list", "target": None, "restore": None, **opts}
     if restore:
-        if positionals or opts["purge"]:
-            raise RemoveArgsError("--restore 不能与账号名 / --purge 同时使用")
+        if positionals or opts["purge"] or opts["purge_memory"]:
+            raise RemoveArgsError("--restore 不能与账号名 / --purge / --purge-memory 同时使用")
         if "/" in restore or "\\" in restore or restore in (".", ".."):
             raise RemoveArgsError("--restore 只接受回收站里的文件名，不能带路径")
         return {"mode": "restore", "target": None, "restore": restore, **opts}
@@ -4562,8 +4974,9 @@ def run_remove_cmd(args_list):
     if any(a in ("-h", "--help") for a in args_list):
         print(REMOVE_USAGE)
         print("  -y, --yes        跳过交互确认（非交互式环境必须显式指定）")
-        print("  --force          放宽保护：删当前活跃账号 / 身份未知的损坏凭证 / 覆盖恢复目标")
-        print("  --purge          直接永久删除，不保留回收站副本")
+        print("  --force          放宽保护：删当前活跃账号 / 身份未知的损坏凭证 / 覆盖恢复目标 / 同 UID 共享记忆")
+        print("  --purge          直接永久删除凭证，不保留回收站副本")
+        print("  --purge-memory   同时清理该账号的人格/记忆（user-<uid>-*/、memory/<uid>_memory.md）")
         print("  --list-trash     列出回收站里的备份")
         print("  --restore <文件>  把指定备份还原为账号配置")
         print("  --json           以 JSON 输出，便于脚本消费")
@@ -4583,7 +4996,8 @@ def run_remove_cmd(args_list):
                                  force=opts["force"], as_json=opts["json"])
         return 0 if res.get("ok") else 1
     res = remove_profile(opts["target"], yes=opts["yes"], force=opts["force"],
-                         purge=opts["purge"], as_json=opts["json"])
+                         purge=opts["purge"], purge_memory=opts["purge_memory"],
+                         as_json=opts["json"])
     return 0 if res.get("ok") else 1
 
 def run_interactive_tool_cmd(args=None):

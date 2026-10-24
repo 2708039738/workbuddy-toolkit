@@ -590,7 +590,19 @@ class InteractiveToolController:
                 return
             force = True
 
-        res = remove_profile(alias, yes=True, force=force, quiet=True)
+        purge_memory = False
+        try:
+            mem_ans = input(
+                f"{COLOR_YELLOW}是否同时清理该账号的人格/记忆（MEMORY/SOUL/USER 等）？"
+                f"默认只删凭证 [y/N]: {COLOR_RESET}"
+            ).strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            mem_ans = ""
+        if mem_ans in ("y", "yes"):
+            purge_memory = True
+            print(f"{COLOR_DIM}记忆会移入 auth_profiles_trash/memory/，可用 --restore 一并还原。{COLOR_RESET}")
+
+        res = remove_profile(alias, yes=True, force=force, purge_memory=purge_memory, quiet=True)
         if not isinstance(res, dict):
             return
         if res.get("ok"):
@@ -598,6 +610,15 @@ class InteractiveToolController:
             print(f"{COLOR_GREEN}✔ 已删除账号 '{alias}'，剩余 {remaining} 个已存账号。{COLOR_RESET}")
             if res.get("trash_path"):
                 print(f"{COLOR_DIM}回收站路径: {res.get('trash_path')}{COLOR_RESET}")
+            mem_action = res.get("memory_action")
+            if mem_action == "trashed":
+                print(f"{COLOR_GREEN}✔ 人格/记忆已移入回收站: {res.get('memory_bundle')}{COLOR_RESET}")
+            elif mem_action == "purged":
+                print(f"{COLOR_GREEN}✔ 该账号的人格/记忆已彻底删除。{COLOR_RESET}")
+            elif mem_action == "not_requested" and res.get("memory_kept"):
+                print(f"{COLOR_YELLOW}注意: 人格/记忆未删除，仍保留在:{COLOR_RESET}")
+                for path in res.get("memory_kept")[:4]:
+                    print(f"{COLOR_DIM}  - {path}{COLOR_RESET}")
             if is_active:
                 print(f"{COLOR_YELLOW}注意: 客户端仍保持当前登录，但本地备份已移除。{COLOR_RESET}")
         else:

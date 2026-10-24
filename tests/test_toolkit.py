@@ -1948,6 +1948,192 @@ class TestWorkBuddyCore(unittest.TestCase):
             bad = workbuddy.restore_from_trash("../x.info", yes=True)
         self.assertFalse(bad["ok"])
 
+    def _write_account_memory(self, uid, marker="mem"):
+        """按客户端真实布局造一份账号档案：user-<uid>-personal/ + memory/<uid>_memory.md"""
+        root = os.path.dirname(workbuddy.PROFILES_DIR)
+        profile_dir = os.path.join(root, "user-{}".format(uid) + "-personal")
+        os.makedirs(profile_dir, exist_ok=True)
+        with open(os.path.join(profile_dir, "MEMORY.md"), "w", encoding="utf-8") as f:
+            f.write("- {}\n".format(marker))
+        memory_dir = os.path.join(root, "memory")
+        os.makedirs(memory_dir, exist_ok=True)
+        cloud_path = os.path.join(memory_dir, "{}_memory.md".format(uid))
+        with open(cloud_path, "w", encoding="utf-8") as f:
+            f.write("cloud-{}".format(marker))
+        return profile_dir, cloud_path
+
+    def test_t69_remove_without_purge_memory_keeps_archive_and_warns(self):
+        """T69: 默认只删凭证；人格/记忆保留，并在输出里列明路径（R5 的默认口径）"""
+        import io
+
+        self._write_profile("drop", "uid-drop", "Drop")
+        profile_dir, cloud_path = self._write_account_memory("uid-drop")
+
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            res = workbuddy.remove_profile("drop", yes=True)
+
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["memory_action"], "not_requested")
+        self.assertTrue(os.path.isdir(profile_dir))
+        self.assertTrue(os.path.exists(cloud_path))
+        self.assertEqual(len(res["memory_kept"]), 2)
+        out = buf.getvalue()
+        self.assertIn("未删除", out)
+        self.assertIn(profile_dir, out)
+        self.assertIn("--purge-memory", out)
+
+    def test_t70_purge_memory_moves_persona_and_cloud_cache(self):
+        """T70: --purge-memory 把 user-<uid>-*/ 与 memory/<uid>_memory.md 成对移入回收站"""
+        import io
+
+        self._write_profile("drop", "uid-drop", "Drop")
+        profile_dir, cloud_path = self._write_account_memory("uid-drop")
+
+        with patch("sys.stdout", io.StringIO()):
+            res = workbuddy.remove_profile("drop", yes=True, purge_memory=True)
+
+        self.assertTrue(res["ok"], res["message"])
+        self.assertEqual(res["action"], "trashed")
+        self.assertEqual(res["memory_action"], "trashed")
+        self.assertFalse(os.path.exists(profile_dir))
+        self.assertFalse(os.path.exists(cloud_path))
+
+        # 凭证备份与记忆归档用同一个 stem 配对，restore 才能一起还原
+        stem = os.path.basename(res["trash_path"])[:-5]
+        bundle = os.path.join(workbuddy.get_memory_trash_dir(), stem)
+        self.assertEqual(res["memory_bundle"], bundle)
+        self.assertTrue(os.path.isfile(os.path.join(bundle, "manifest.json")))
+        self.assertEqual(len(res["memory_items"]), 2)
+
+    def test_t71_purge_memory_refuses_shared_uid_unless_force(self):
+        """T71: 同一 UID 还有别的 Profile 时，默认拒绝清记忆，且不产生任何删除"""
+        import io
+
+        path_a = self._write_profile("alias_a", "uid-shared", "A")
+        self._write_profile("alias_b", "uid-shared", "B")
+        profile_dir, cloud_path = self._write_account_memory("uid-shared")
+
+        with patch("sys.stdout", io.StringIO()):
+            refused = workbuddy.remove_profile("alias_a", yes=True, purge_memory=True)
+        self.assertFalse(refused["ok"])
+        self.assertEqual(refused["action"], "refused_shared_uid")
+        self.assertTrue(os.path.exists(path_a))
+        self.assertTrue(os.path.isdir(profile_dir))
+        self.assertTrue(os.path.exists(cloud_path))
+
+        with patch("sys.stdout", io.StringIO()):
+            forced = workbuddy.remove_profile("alias_a", yes=True, purge_memory=True, force=True)
+        self.assertTrue(forced["ok"], forced["message"])
+        self.assertEqual(forced["memory_action"], "trashed")
+        self.assertFalse(os.path.isdir(profile_dir))
+
+    def test_t72_restore_brings_back_credential_and_memory(self):
+        """T72: --restore 不只还原凭证，还把配对的人格/记忆放回原路径"""
+        import io
+
+        path = self._write_profile("roundmem", "uid-rm", "RM")
+        profile_dir, cloud_path = self._write_account_memory("uid-rm", marker="round")
+
+        with patch("sys.stdout", io.StringIO()):
+            removed = workbuddy.remove_profile("roundmem", yes=True, purge_memory=True)
+        self.assertTrue(removed["ok"], removed["message"])
+        name = os.path.basename(removed["trash_path"])
+        self.assertFalse(os.path.exists(path))
+        self.assertFalse(os.path.exists(profile_dir))
+
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            restored = workbuddy.restore_from_trash(name, yes=True)
+        self.assertTrue(restored["ok"], restored["message"])
+        self.assertEqual(restored["memory_action"], "restored")
+        self.assertTrue(os.path.exists(path))
+        self.assertTrue(os.path.isdir(profile_dir))
+        with open(os.path.join(profile_dir, "MEMORY.md"), "r", encoding="utf-8") as f:
+            self.assertIn("round", f.read())
+        self.assertTrue(os.path.exists(cloud_path))
+        self.assertFalse(os.path.isdir(removed["memory_bundle"]))
+
+    def test_t73_purge_memory_rejects_traversal_uid(self):
+        """T73: 凭证里的 UID 含路径成分时，绝不能据此拼接并搬走数据根外的目录"""
+        import io
+
+        outside_name = "outside-" + os.path.basename(self.test_dir)
+        uid_bad = "../../" + outside_name
+        path = self._write_profile("evil", uid_bad, "Evil")
+        outside = os.path.join(os.path.dirname(os.path.dirname(workbuddy.PROFILES_DIR)), outside_name)
+        os.makedirs(outside, exist_ok=True)
+        self.addCleanup(shutil.rmtree, outside, True)
+        marker = os.path.join(outside, "MEMORY.md")
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write("must-stay")
+
+        with patch("sys.stdout", io.StringIO()):
+            res = workbuddy.remove_profile("evil", yes=True, purge_memory=True, force=True)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["action"], "refused_memory_unknown_uid")
+        self.assertTrue(os.path.exists(path))
+        self.assertTrue(os.path.exists(marker))
+
+        # 直接调用归档函数也不能越界
+        with patch("sys.stdout", io.StringIO()):
+            archived = workbuddy.archive_account_memory(uid_bad, "evil", "stem-x")
+        self.assertEqual(archived["action"], "skipped_invalid_uid")
+        self.assertFalse(os.path.exists(os.path.join(workbuddy.get_memory_trash_dir(), "stem-x")))
+        self.assertTrue(os.path.exists(marker))
+
+    def test_t74_purge_with_purge_memory_removes_both(self):
+        """T74: --purge --purge-memory 彻底抹除凭证与档案，回收站里不留副本"""
+        import io
+
+        self._write_profile("gone", "uid-gone", "Gone")
+        profile_dir, cloud_path = self._write_account_memory("uid-gone")
+
+        with patch("sys.stdout", io.StringIO()):
+            res = workbuddy.remove_profile("gone", yes=True, purge=True, purge_memory=True)
+
+        self.assertTrue(res["ok"], res["message"])
+        self.assertEqual(res["action"], "purged")
+        self.assertEqual(res["memory_action"], "purged")
+        self.assertIsNone(res["trash_path"])
+        self.assertFalse(os.path.exists(profile_dir))
+        self.assertFalse(os.path.exists(cloud_path))
+        memory_trash = workbuddy.get_memory_trash_dir()
+        self.assertFalse(os.path.isdir(memory_trash) and os.listdir(memory_trash))
+
+    def test_t75_cli_purge_memory_flag_and_conflicts(self):
+        """T75: --purge-memory 只与删除模式共存；与列表/恢复同时出现按参数错误拒绝"""
+        parsed = workbuddy._parse_remove_cli_args(["demo", "--purge-memory", "--yes"])
+        self.assertTrue(parsed["purge_memory"])
+        self.assertTrue(parsed["yes"])
+
+        for bad in (["--list-trash", "--purge-memory"],
+                    ["--restore", "x.info", "--purge-memory"]):
+            with self.assertRaises(workbuddy.RemoveArgsError):
+                workbuddy._parse_remove_cli_args(bad)
+            import io
+            with patch("sys.stdout", io.StringIO()):
+                self.assertEqual(workbuddy.run_remove_cmd(bad), 2)
+
+    def test_t76_archive_failure_rolls_back_credential(self):
+        """T76: 档案搬运失败时凭证必须放回原处，不能出现"凭证没了"的半成品"""
+        import io
+
+        path = self._write_profile("rollback", "uid-rb", "RB")
+        self._write_account_memory("uid-rb")
+        fake = {"action": "error", "message": "模拟磁盘拒绝", "bundle": None, "items": []}
+
+        with patch.object(workbuddy, "archive_account_memory", return_value=fake):
+            with patch("sys.stdout", io.StringIO()):
+                res = workbuddy.remove_profile("rollback", yes=True, purge_memory=True)
+
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["action"], "error")
+        self.assertTrue(os.path.exists(path))
+        trash_dir = workbuddy.get_profiles_trash_dir()
+        leftovers = [n for n in os.listdir(trash_dir) if n.endswith(".info")] if os.path.isdir(trash_dir) else []
+        self.assertEqual(leftovers, [])
+
 if __name__ == "__main__":
     unittest.main()
 

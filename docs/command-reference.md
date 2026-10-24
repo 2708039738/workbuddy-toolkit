@@ -77,36 +77,55 @@ wb-switch
 
 ### 删除账号
 
+删除分两层：**凭证**与**账号档案**。默认只删凭证，档案保留并在输出里列明路径；要连人格/记忆一起清，加 `--purge-memory`。
+
+| 层 | 具体内容 | 默认 | `--purge-memory` |
+|---|---|---|---|
+| 凭证 | `auth_profiles/<别名>.info` | 移入回收站 | 与凭证同样处理 |
+| 账号档案 | `user-<uid>-*/`（`MEMORY.md` / `SOUL.md` / `USER.md` / `IDENTITY.md`）、`memory/<uid>_memory.md(.bak)`、工具箱记忆副本 `cache/shared_memory/{originals,backups}/<uid>/` | **保留**，输出列明位置 | 与凭证配对移入回收站，`--purge` 时一并抹除 |
+
 ```bash
-workbuddy remove <账号名|昵称|UID> [--yes] [--force] [--purge] [--json]
+workbuddy remove <账号名|昵称|UID> [--yes] [--force] [--purge] [--purge-memory] [--json]
 workbuddy remove --list-trash [--json]
 workbuddy remove --restore <回收站文件名> [--yes] [--force] [--json]
 ```
 
 （`wb-remove` 是安装后提供的别名，参数完全相同。）
 
-删除的是本地已保存的凭证文件，不涉及服务端账号，也不会删除该账号的会话历史与工作区数据。
+不涉及服务端账号；也不删会话历史（`workbuddy.db`）、`storage/user-<uid>*` 与 `~/.workbuddy/<uid>/` 下的侧栏快照——那些是会话与界面数据，不是人格/记忆。
 
 参数：
 
 | 参数 | 含义 |
 |---|---|
 | `-y` / `--yes` / `--confirm` | 跳过交互确认。非 TTY 环境（管道、cron、定时任务）**必须**带上，否则直接拒绝执行（退出码 1） |
-| `--force` | 只表示「放宽保护」：删除当前活跃账号、删除身份未知的损坏凭证、恢复时覆盖同名账号。**不再与 `-y` 互为别名**，不能替代确认 |
-| `--purge` | 永久删除，不进回收站 |
-| `--json` | 输出机器可读结果 |
+| `--force` | 只表示「放宽保护」：删除当前活跃账号、删除身份未知的损坏凭证、恢复时覆盖同名账号、同一 UID 有多份 Profile 时仍清记忆。**不再与 `-y` 互为别名**，不能替代确认 |
+| `--purge` | 凭证与已归档的账号档案永久删除，不进回收站 |
+| `--purge-memory` | 同时清理该 UID 的人格/记忆档案；默认移入回收站，与 `--purge` 连用才抹除 |
+| `--json` | 输出机器可读结果（含 `memory_action` / `memory_bundle` / `memory_items` / `memory_kept`） |
 | `--` | 之后的内容一律按位置参数处理，用于 `-weird` 这类以连字符开头的账号别名，例如 `workbuddy remove --yes -- -weird` |
 
 未知选项、或给出的目标账号多于一个时，只打印用法并以**退出码 2** 结束，不执行任何删除。
 
-默认把凭证移入 `~/.workbuddy/auth_profiles_trash/`，需要彻底抹除时加 `--purge`：
+常用写法：
 
 ```bash
-workbuddy remove old_acc --yes            # 移入回收站
-workbuddy remove old_acc --yes --purge    # 永久删除，不留副本
+workbuddy remove old_acc --yes                          # 只删凭证，记忆保留并提示位置
+workbuddy remove old_acc --yes --purge-memory           # 凭证 + 人格/记忆一起进回收站
+workbuddy remove old_acc --yes --purge --purge-memory   # 两者都彻底抹除
 ```
 
-回收站里的备份文件名形如 `<别名>-<YYYYMMDD-HHMMSS>[-序号].info`，用 `O_CREAT|O_EXCL` 独占创建，避免并发删除同名账号时互相覆盖。
+回收站布局：
+
+```
+~/.workbuddy/auth_profiles_trash/
+├── <别名>-<YYYYMMDD-HHMMSS>[-序号].info      # 凭证
+└── memory/<同一个 stem>/                      # 与凭证配对的账号档案
+    ├── manifest.json                          # 原路径清单，restore 据此还原
+    └── files/...
+```
+
+凭证备份名用 `O_CREAT|O_EXCL` 独占创建，避免并发删除同名账号时互相覆盖。
 
 保护规则：
 
@@ -114,16 +133,18 @@ workbuddy remove old_acc --yes --purge    # 永久删除，不留副本
 - 删除当前活跃账号需要显式 `--force`：客户端会保持当前登录，但本地不再有备份，切走后只能重新扫码；
 - 非交互式环境（管道、cron、定时任务）必须显式 `--yes`，否则直接拒绝（退出码 1），避免脚本误删；
 - 同一 UID 已无其他账号时，同步清理审计缓存，避免 `wb-status` / `wb-audit` 继续显示已删除账号；
+- 同一 UID 若还有别的 Profile，`--purge-memory` 默认拒绝（记忆按 UID 共享，清掉会让剩下那份登录后记忆全空），确认要清需再加 `--force`；
+- 凭证里没有合法 UID（损坏、缺字段、含 `../` 等路径成分）时拒绝清记忆——路径按 UID 拼接，猜错会动到别的账号；
 - 半截 JSON 之类的损坏凭证不会被 `wb-list` 收录，此时按文件名兜底删除，但**必须显式 `--force`**，因为其身份无法校验（输出会标注身份未经校验）。
 
 误删可从回收站恢复：
 
 ```bash
 workbuddy remove --list-trash                                  # 列出文件名、大小、时间
-workbuddy remove --restore demo-20260101-000000.info --yes     # 还原为 auth_profiles/<别名>.info
+workbuddy remove --restore demo-20260101-000000.info --yes     # 还原凭证 + 配对的人格/记忆
 ```
 
-`--restore` 把该备份还原为 `~/.workbuddy/auth_profiles/<别名>.info`；目标已存在则拒绝，需要 `--force` 覆盖。
+`--restore` 把该备份还原为 `~/.workbuddy/auth_profiles/<别名>.info`；目标已存在则拒绝，需要 `--force` 覆盖。若存在同 stem 的记忆归档，会一并还原；**已存在的记忆路径一律不覆盖**，跳过项与归档位置会在输出里列明。
 
 如果账号别名刚好是 `remove` / `rm` / `delete` / `del` / `forget`，这几个词现在优先按子命令解析。切换这类账号请显式用 `workbuddy switch <别名>`；裸敲命令（如 `workbuddy rm`）只会打印用法，不会删除任何账号。
 

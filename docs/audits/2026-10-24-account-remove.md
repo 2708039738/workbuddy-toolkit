@@ -626,13 +626,13 @@ Windows 单平台验证；符号链接与 POSIX 权限位未验证；无真实�
 
 ### 16.4 旧实现/新实现对照
 
-把新增 T77–T81 复制到 `fca0b6d` 的干净导出目录执行：T77 FAIL、T78 ERROR、T79 ERROR、T80 FAIL、T81 FAIL；在修复后的分支上全部通过。T82 仅 POSIX，Windows skip。
+把新增 T77–T83 复制到 `fca0b6d` 的干净导出目录执行：T77 FAIL、T78 ERROR、T79 ERROR、T80 FAIL、T81 FAIL、T83 FAIL；在修复后的分支上全部通过。T82 仅 POSIX，Windows skip。
 
-修复后 `git archive HEAD` 干净导出的全量结果：**242 tests / 0 failure / 1 error / 15 skipped**；唯一 error 仍是 `test_log_guard` 调 `schtasks.exe` 被本机沙箱拦截（与改动无关）。另在独立 worktree `wb-adv-e`（同一 commit）复跑了回滚、junction、CLI、规模与跨卷探针。
+修复后 `git archive HEAD` 干净导出的全量结果：**243 tests / 0 failure / 1 error / 15 skipped**；唯一 error 仍是 `test_log_guard` 调 `schtasks.exe` 被本机沙箱拦截（与改动无关）。另在独立 worktree `wb-adv-e`（同一 commit）复跑了回滚、junction、CLI、规模与跨卷探针。
 
 ### 16.5 仍未验证
 
 - 本机 sandbox 会静默吞掉 `os.symlink`（返回成功但不建链接），普通符号链接的删除/还原只做了代码审查；junction 已实测。
-- 跨卷 fallback 只做了 `os.replace` 抛 `EXDEV` 的模拟，未在真实第二块卷上跑；中断时可能留下"源部分删除 + 目标完整副本"，不会丢唯一副本但可能重复占用空间。
+- 跨卷 fallback 用「只让跨根 `os.replace` 抛 `EXDEV`」模拟，未在真实第二块卷上跑；中断时可能留下"源部分删除 + 目标完整副本"，不会丢唯一副本但可能重复占用空间。T83 已覆盖"嵌套 junction 拒绝复制"。
 - 活跃账号 + 客户端持有句柄：Windows 下归档会失败并回滚，需先切号/退出客户端；未在真实客户端上验证。
 - CI 仍未运行。

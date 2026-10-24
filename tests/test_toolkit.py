@@ -1740,6 +1740,32 @@ class TestWorkBuddyCore(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 0, buf.getvalue())
         self.assertFalse(os.path.exists(path))
 
+    def test_t62_reserved_alias_never_auto_deleted(self):
+        """T62: 别名与子命令同名时，裸敲命令只打印用法，绝不删除同名账号"""
+        import io
+
+        paths = {}
+        for reserved in ("remove", "rm", "delete", "del", "forget"):
+            paths[reserved] = self._write_profile(reserved, f"uid-{reserved}", f"别名{reserved}")
+
+        for reserved in paths:
+            buf = io.StringIO()
+            with patch("sys.stdout", buf):
+                with patch("sys.argv", ["workbuddy", reserved]):
+                    with self.assertRaises(SystemExit) as ctx:
+                        workbuddy.main()
+            self.assertEqual(ctx.exception.code, 2, f"{reserved}: {buf.getvalue()}")
+            self.assertIn("用法", buf.getvalue())
+            self.assertTrue(os.path.exists(paths[reserved]), f"账号 {reserved} 被误删")
+
+        # 同名账号仍可通过 switch 正常切换
+        with patch.object(workbuddy, "switch_to_profile", return_value=True) as m:
+            with patch("sys.stdout", io.StringIO()):
+                with patch("sys.argv", ["workbuddy", "switch", "rm"]):
+                    workbuddy.main()
+        self.assertTrue(m.called)
+        self.assertEqual(m.call_args[0][0], "rm")
+
 if __name__ == "__main__":
     unittest.main()
 

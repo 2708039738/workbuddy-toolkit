@@ -104,6 +104,8 @@ wb-remove old_acc --yes --purge    # 永久删除，不留副本
 mv ~/.workbuddy/auth_profiles_trash/<别名>-<时间戳>.info ~/.workbuddy/auth_profiles/<别名>.info
 ```
 
+如果账号别名刚好是 `remove` / `rm` / `delete` / `del` / `forget`，这几个词现在优先按子命令解析。切换这类账号请显式用 `workbuddy switch <别名>`；裸敲命令（如 `workbuddy rm`）只会打印用法，不会删除任何账号。
+
 ## 健康检查与诊断
 
 ### 凭据巡检

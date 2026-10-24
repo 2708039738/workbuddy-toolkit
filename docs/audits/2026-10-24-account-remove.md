@@ -580,3 +580,57 @@ Windows 单平台验证；符号链接与 POSIX 权限位未验证；无真实�
 - **跨卷**：`os.replace` 失败后走 `copytree + 删除`，大目录耗时未测；中断时可能留下部分副本（原目录不删）。
 - **软链接**：归档会跳过符号链接，但真实账号目录通常不含链接；未构造真实链接场景。
 - CI 仍未运行。
+
+---
+
+## 16. 第二轮对抗式审查（2026-10-24 晚）
+
+> 审查对象：`fca0b6d`（含 `--purge-memory` 的实现）。目标是"能不能弄丢数据 / 能不能骗过保护 / 能不能让用户误判"。
+> 原计划派 4 个子 Agent 并行；实际调用均被平台 429 频率限制拒绝，改为在 4 个独立 worktree 中自行执行 A/B/C/D 四条线。方法变了，攻击面不变。
+
+### 16.1 审查线
+
+| 线 | 范围 | 环境 |
+|---|---|---|
+| A | UID 校验、路径前缀、符号链接/junction、manifest 篡改、权限 | `wb-adv-a` + 临时数据根 |
+| B | 故障注入、回滚、并发、崩溃窗口 | `wb-adv-b` + 临时数据根 |
+| C | 参数、退出码、JSON、`--list-trash`、`--restore`、TUI | `wb-adv-c` + 临时数据根 |
+| D | 只读/被占用文件、2000 文件规模、跨卷 fallback、回归 | `wb-adv-d` + 干净导出目录 |
+
+### 16.2 发现与处理
+
+| 编号 | 级别 | 问题 | 复现 | 处理 |
+|---|---|---|---|---|
+| R1 | **P0** | `archive_account_memory` 搬运第 2 项失败、回滚第 1 项也失败时，仍执行 `_remove_tree(bundle)`，把唯一一份 `MEMORY.md` 删掉 | 故障注入第 3 次 `_move_path` 抛错、第 4 次（回滚）再抛错；修复前 `user-<uid>-personal/` 与 bundle 同时消失 | 回滚失败即保留 bundle，并写 `partial` 清单；新增 T77（旧实现 FAIL） |
+| R2 | **P1** | Windows junction 的 `os.path.islink` 为 False；`_remove_tree` 把 junction 当普通目录走进去，删除的是**目标**内容 | `mklink /J` 造 `user-<uid>-personal` → `inside/`；`_remove_tree` 后 `inside/MEMORY.md` 消失 | 新增 `_is_reparse_point` / `_unlink_reparse`；遍历只删链接本体；发现阶段跳过 reparse point 并输出提示；新增 T79（旧实现 ERROR） |
+| R3 | **P1** | 档案失败后凭证回滚也失败时，输出仍写"凭证已放回原处"，实际文件还在回收站 | 第 2 次 `_move_path` 抛错（回滚凭证） | 增加 `credential_restored`；失败时明确"仍在回收站 + 手工恢复"；新增 T78（旧实现 ERROR） |
+| R4 | **P2** | `--list-trash` 只列 `.info`；只剩记忆归档时说"回收站为空"，用户无法发现/还原 | 删除 `--purge-memory` 后手工删掉 `.info`，`--list-trash` 输出"回收站为空" | 列表增加 `memory_count` / `memory_bundles`；新增 `--restore-memory <stem>`；新增 T80（旧实现 FAIL） |
+| R5 | **P2** | 同名 stem 的旧记忆归档还在时，新凭证备份复用同名，`exist_ok=True` 可能把两份档案混进同一 bundle | 固定时间戳 + 预置 `memory/<stem>/`，旧实现返回同名 `.info` | `_reserve_trash_path` 跳过已存在的记忆 stem；新增 T81（旧实现 FAIL） |
+| R6 | **P2** | 明文人格/记忆归档目录权限随 umask，POSIX 下可能被同机其他用户遍历 | 代码审查；Windows 无法验证 POSIX 位 | bundle/files 目录 `0700`，清单 `0600`；新增 T82（Windows skip） |
+| R7 | P3 | 符号链接/junction 被静默跳过，用户以为已清干净 | 发现阶段直接 `continue`，无输出 | `get_account_reparse_points` 列出并在输出/JSON 里标注"未处理" |
+| R8 | P3 | 跨卷 `copytree` 会把目录内嵌的 junction 当普通目录递归复制，把目标内容拷进回收站 | 代码审查；本机无第二块卷，未造真实跨卷 | `_tree_has_reparse` 在复制前扫树，有链接即拒绝跨卷移动 |
+
+### 16.3 已验证不成立的攻击
+
+| 攻击 | 结果 |
+|---|---|
+| UID 含 `../`、换行、空格、盘符、冒号、全角字符、65 字符 | `is_valid_account_uid` 全部拒绝 |
+| uid=`abc` 误匹配 `user-abcdef-*` | 只匹配 `user-abc` / `user-abc-*`，未误伤 |
+| manifest 的 `src` 指向数据根外、`rel` 含 `..` / 绝对路径 / UNC | `restore_account_memory` 全部跳过；根外诱饵文件未动 |
+| `_remove_tree` 遇到普通符号链接 | 只删链接，目标保留 |
+| 只读文件归档 | Windows 下可正常移动；`--purge` 的删除失败会保留回收站副本 |
+| 同进程持有 `MEMORY.md` 句柄 | 归档失败并完整回滚，凭证回到原位 |
+| 2000 文件目录 | 归档 0.03s、还原 0.02s，文件数 2001 一致 |
+| 参数 `--purge-memory=true`、多目标、`--list-trash` 冲突 | 退出码 2，不执行删除 |
+| `--json` 输出混入日志 | 纯 JSON，可解析 |
+
+### 16.4 旧实现/新实现对照
+
+把新增 T77–T81 复制到 `fca0b6d` 的干净导出目录执行：T77 FAIL、T78 ERROR、T79 ERROR、T80 FAIL、T81 FAIL；在修复后的分支上全部通过。T82 仅 POSIX，Windows skip。
+
+### 16.5 仍未验证
+
+- 本机 sandbox 会静默吞掉 `os.symlink`（返回成功但不建链接），普通符号链接的删除/还原只做了代码审查；junction 已实测。
+- 跨卷 fallback 只做了 `os.replace` 抛 `EXDEV` 的模拟，未在真实第二块卷上跑；中断时可能留下"源部分删除 + 目标完整副本"，不会丢唯一副本但可能重复占用空间。
+- 活跃账号 + 客户端持有句柄：Windows 下归档会失败并回滚，需先切号/退出客户端；未在真实客户端上验证。
+- CI 仍未运行。

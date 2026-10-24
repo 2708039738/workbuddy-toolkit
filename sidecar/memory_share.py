@@ -488,6 +488,16 @@ def is_local_fact(text):
     return bool(_LOCAL_FACT_PAT.search(norm))
 
 
+def is_fragment(text):
+    """引用块、斜体元信息、表格行不是"一条规则"，是文档格式的碎片。
+
+    它们常常含"必须/不要"这类词而骗过分级（例："> **启用条件**：…**不启用**"），
+    但单独搬到另一个账号只会变成读不懂的断句。
+    """
+    s = str(text or "").lstrip()
+    return s.startswith((">", "*", "_", "|")) or s in ("-", "--")
+
+
 def publishable(entries, budget=PUBLISH_BUDGET, max_level=PUBLISH_MAX_LEVEL,
                 limit=MAX_PUBLISH_ENTRIES):
     """挑出可跨账号发布的条目，返回 (选中, 统计)。
@@ -499,7 +509,8 @@ def publishable(entries, budget=PUBLISH_BUDGET, max_level=PUBLISH_MAX_LEVEL,
                      key=lambda e: (publish_level(e.get("text", "")),
                                     -float(e.get("quality", 0) or 0)))
     picked = []
-    skipped = {"level": 0, "local_fact": 0, "budget": 0, "empty": 0, "conflict": 0}
+    skipped = {"level": 0, "local_fact": 0, "budget": 0, "empty": 0,
+               "conflict": 0, "fragment": 0}
     used = 0
     for entry in ordered:
         text = str(entry.get("text") or "").strip()
@@ -509,6 +520,9 @@ def publishable(entries, budget=PUBLISH_BUDGET, max_level=PUBLISH_MAX_LEVEL,
         if entry.get("suppressed"):
             # 与另一条规则互相否定，且优先级落败：保留在库里备查，但不注入
             skipped["conflict"] += 1
+            continue
+        if is_fragment(text):
+            skipped["fragment"] += 1
             continue
         # 先判"是不是本机事实"：这个理由比"级别不够"更具体，
         # 一条带 D:/ 路径的规则被拦下时，用户需要看到的是"含本机路径"而不是"级别低"
@@ -621,8 +635,14 @@ def render(origin_text, shared_entries, limit=INJECT_LIMIT, index_entries=None):
     """
     origin = (origin_text or "").rstrip()
     index_entries = list(index_entries or [])
+
+    def _plain():
+        # 原文自己就顶到 4000 时，不能再补一个换行——那会写出 4001 字的文件，
+        # 客户端只会注入前 4000 字，最后一行永远看不到
+        return origin + "\n" if len(origin) + 1 <= limit else origin
+
     if not shared_entries and not index_entries:
-        return origin + "\n", 0, 0, 0
+        return _plain(), 0, 0, 0
 
     # 保留原文的换行风格：CRLF 文件不能被我改写成 LF，那是"原文一字不改"的底线
     eol = "\r\n" if "\r\n" in origin else "\n"
@@ -667,12 +687,12 @@ def render(origin_text, shared_entries, limit=INJECT_LIMIT, index_entries=None):
 
     lines = body + ([INDEX_MARKER] + index_lines if index_lines else [])
     if not lines:
-        return origin + "\n", 0, len(shared_entries), 0
+        return _plain(), 0, len(shared_entries), 0
     text = compose(lines, footer)
     if len(text) > limit:
         # 兜底：上面每一步都按最终长度校验过，走到这里说明有未预料的溢出。
         # 宁可少写一条共享，也不能写出一个会被客户端截断的文件。
-        return origin + "\n", 0, len(shared_entries), 0
+        return _plain(), 0, len(shared_entries), 0
     return text, written, max(0, len(shared_entries) - written), len(index_lines)
 
 
@@ -890,22 +910,35 @@ def _rebalance_locked(acc, root, target, apply):
         result["action"] = "skipped_encoding" if state == "not_utf8" else "no_memory_file"
         return result
 
+    # 规划只看自有内容：共享段落由 apply 维护，不能被当成"一节"搬进 SOUL
+    own_text = strip_shared_block(mem_text)
+    shared_block = ""
+    if has_shared_block(mem_text):
+        s = mem_text.find(BEGIN_MARK)
+        e = mem_text.find(END_MARK) + len(END_MARK)
+        shared_block = mem_text[s:e].strip()
+
     # 有分节结构的文档按整节搬（不拆列表）；散条目的文档仍按行搬
-    blocks = _split_sections(mem_text)
+    blocks = _split_sections(own_text)
     has_sections = sum(1 for head, _ in blocks if head and head.startswith("## ")) >= 2
-    plan = (plan_rebalance_sections(mem_text, target=target) if has_sections
-            else plan_rebalance(mem_text, target=target))
+    plan = (plan_rebalance_sections(own_text, target=target) if has_sections
+            else plan_rebalance(own_text, target=target))
     if "mode" not in plan:
         plan["mode"] = "line"
-    soul_before = len(read_text(soul_path))
-    user_before = len(read_text(user_path))
+    # 投影要减掉上一次分诊写进去的受管段落，否则重复计数，
+    # 明明文件没变也会显示 5253 → 8634
+    soul_base = len(strip_rebalance_section(read_text_exact(soul_path)))
+    user_base = len(strip_rebalance_section(read_text_exact(user_path)))
+    soul_before = len(read_text_exact(soul_path))
+    user_before = len(read_text_exact(user_path))
     result["projected"] = {
-        "memory_before": len(mem_text),
+        "memory_before": len(own_text),
         "memory_after": plan["memory_size"],
+        "shared_chars": len(shared_block),
         "soul_before": soul_before,
-        "soul_after": soul_before + plan["moved_soul_size"],
+        "soul_after": soul_base + plan["moved_soul_size"],
         "user_before": user_before,
-        "user_after": user_before + plan["moved_user_size"],
+        "user_after": user_base + plan["moved_user_size"],
     }
     result["plan"] = {
         "mode": plan.get("mode"),
@@ -943,7 +976,11 @@ def _rebalance_locked(acc, root, target, apply):
         atomic_write_text(user_path, user_text)
         result["written"].append("USER.md")
 
-    atomic_write_text(mem_path, "\n".join(plan["kept"]).rstrip() + "\n")
+    new_mem = "\n".join(plan["kept"]).rstrip() + "\n"
+    if shared_block:
+        # 共享段落不属于"自有内容"，原样保留在文件末尾，等下轮 apply 重新渲染
+        new_mem = new_mem.rstrip() + "\n\n" + shared_block + "\n"
+    atomic_write_text(mem_path, new_mem)
     result["written"].append(MEMORY_FILE)
     result["ok"] = True
     result["action"] = "rebalanced"
@@ -1295,11 +1332,18 @@ def _apply_locked(acc, root, lib, budget, max_level):
         result["action"] = "skipped_encoding"
         result["reason"] = "MEMORY.md 不是 UTF-8 编码，已跳过（未做任何写入）"
         return result
-    baseline = _ensure_snapshot(root, uid, path, current_text=current)
-    new_baseline, added, upgraded = absorb(baseline, strip_shared_block(current))
-    if new_baseline != baseline:
+    # 基线取"文件里现在的自有内容"，不是首次快照。
+    # 快照是接入那一刻的原样，只用于 restore；拿它当基线会把 rebalance 刚搬走的
+    # 章节原样写回来——分诊被撤销，文件回到 5953 字，共享段落又落到截断线外。
+    own_text = strip_shared_block(current)
+    snap_before = _ensure_snapshot(root, uid, path, current_text=current)
+    new_snap, added, upgraded = absorb(snap_before, own_text)
+    if new_snap != snap_before:
+        # 用户手写的新条目仍要进快照，否则 restore 会把它抹掉
         backup_file(snapshot_path(root, uid), root)
-        atomic_write_text(snapshot_path(root, uid), new_baseline)
+        atomic_write_text(snapshot_path(root, uid), new_snap)
+    baseline = own_text
+    new_baseline = baseline
     result["added"] = added
     result["upgraded"] = upgraded
 
@@ -1446,6 +1490,19 @@ def _restore_locked(acc, root):
         return result
     result["backup"] = backup_file(path, root)
     atomic_write_text(path, read_text_exact(snap))
+
+    # 还原是"回到 rebalance 之前"，所以 SOUL/USER 里由分诊写入的段落也要摘掉，
+    # 否则内容会在 MEMORY 与 SOUL 各存一份
+    d = os.path.dirname(path)
+    cleaned = []
+    for name in ("SOUL.md", "USER.md"):
+        p = os.path.join(d, name)
+        text = read_text_exact(p)
+        if REBALANCE_BEGIN in text:
+            backup_file(p, root)
+            atomic_write_text(p, strip_rebalance_section(text))
+            cleaned.append(name)
+    result["cleaned"] = cleaned
     result["ok"] = True
     result["action"] = "restored"
     return result

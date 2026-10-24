@@ -4441,6 +4441,8 @@ def run_memory_cmd(args_list):
                         why.append(f"{sk['level']} 条属事实/推断，不跨账号")
                     if sk.get("local_fact"):
                         why.append(f"{sk['local_fact']} 条含本机路径/账号")
+                    if sk.get("fragment"):
+                        why.append(f"{sk['fragment']} 条是引用/表格碎片")
                     if sk.get("conflict"):
                         why.append(f"{sk['conflict']} 条被冲突压制")
                     if sk.get("budget"):

@@ -575,6 +575,67 @@ class TestSectionRebalance(unittest.TestCase):
         self.assertNotIn("## 一、环境", plan["moved_soul"])
 
 
+    def test_41_document_fragments_are_not_published(self):
+        """T41: 引用块/斜体/表格行不是规则，不能跨账号"""
+        entries = [{"text": "> **启用条件**：涉及视频时生效，其它任务**不启用**", "quality": 7.0},
+                   {"text": "*本文件用于记录跨项目规则*", "quality": 6.0},
+                   {"text": "| 通道 | 上限 |", "quality": 5.0},
+                   {"text": "- 提交前必须跑测试", "quality": 6.0}]
+        picked, stats = ms.publishable(entries)
+        self.assertEqual([e["text"] for e in picked], ["- 提交前必须跑测试"])
+        self.assertEqual(stats["fragment"], 3)
+
+
+class TestRebalanceThenPublish(unittest.TestCase):
+    """分诊与发布必须兼容：apply 不能把刚搬走的章节写回来。"""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.a = {"alias": "alpha", "uid": "uid-a"}
+        self.b = {"alias": "beta", "uid": "uid-b"}
+        d = ms.memory_dir(self.root, "uid-a")
+        os.makedirs(d, exist_ok=True)
+        self.mem_a = os.path.join(d, "MEMORY.md")
+        with open(self.mem_a, "w", encoding="utf-8") as f:
+            f.write("# MEMORY.md\n"
+                    "## 一、方法论\n" + "\n".join(
+                        "- 必须遵守准则 {}".format(i) for i in range(60)) + "\n"
+                    "## 二、环境\n- 工作区在 D:/work/app\n- 虚拟环境在 D:/venv\n")
+        d = ms.memory_dir(self.root, "uid-b")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "MEMORY.md"), "w", encoding="utf-8") as f:
+            f.write("# 记忆\n- 提交前必须跑全量测试\n")
+
+    def test_42_apply_does_not_undo_rebalance(self):
+        """T42: 分诊后 apply，搬走的章节不能回到 MEMORY"""
+        before = open(self.mem_a, encoding="utf-8").read()
+        ms.rebalance_account(self.a, root=self.root, target=300, apply=True)
+        slim = open(self.mem_a, encoding="utf-8").read()
+        self.assertLess(len(slim), len(before))
+        self.assertNotIn("必须遵守准则 0", slim)
+
+        ms.collect([self.a, self.b], root=self.root)
+        ms.apply_account(self.a, root=self.root)
+        after = open(self.mem_a, encoding="utf-8").read()
+
+        self.assertNotIn("必须遵守准则 0", after, "分诊被 apply 撤销了")
+        self.assertLessEqual(len(after.strip()), ms.INJECT_LIMIT, "共享段落必须落在窗口内")
+        self.assertIn(ms.BEGIN_MARK, after)
+
+    def test_43_restore_also_clears_rebalance_section(self):
+        """T43: restore 回到分诊前，SOUL 里的受管段落要一并摘掉，避免两处重复"""
+        ms.rebalance_account(self.a, root=self.root, target=300, apply=True)
+        soul = os.path.join(ms.memory_dir(self.root, "uid-a"), "SOUL.md")
+        self.assertIn(ms.REBALANCE_BEGIN, open(soul, encoding="utf-8").read())
+
+        res = ms.restore_account(self.a, root=self.root)
+        self.assertTrue(res["ok"])
+        self.assertIn("SOUL.md", res.get("cleaned") or [])
+        self.assertNotIn(ms.REBALANCE_BEGIN, open(soul, encoding="utf-8").read())
+        self.assertIn("必须遵守准则 0", open(self.mem_a, encoding="utf-8").read())
+
+
 class TestMemoryHubCli(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp()

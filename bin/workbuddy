@@ -4672,7 +4672,7 @@ def main():
         alias = clean_args[0] if clean_args else None
         run_login(alias=alias, auto_switch=auto_switch, force=force)
         return
-    # 精确匹配程序名，不做子串匹配：装在 /home/x/remove-tools/workbuddy 这类型录会被误判
+    # 精确匹配程序名，不做子串匹配：只要安装目录里带 remove 字样就会被误判
     if clean_prog in ("wb-remove", "workbuddy-remove", "wb-rm", "workbuddy-rm"):
         sys.exit(run_remove_cmd(args))
     if "audit" in prog_name:

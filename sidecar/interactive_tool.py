@@ -619,6 +619,10 @@ class InteractiveToolController:
                 print(f"{COLOR_YELLOW}注意: 人格/记忆未删除，仍保留在:{COLOR_RESET}")
                 for path in res.get("memory_kept")[:4]:
                     print(f"{COLOR_DIM}  - {path}{COLOR_RESET}")
+            if res.get("memory_links"):
+                print(f"{COLOR_YELLOW}注意: 以下符号链接/junction 未处理（不会进入目标）:{COLOR_RESET}")
+                for item in res.get("memory_links")[:4]:
+                    print(f"{COLOR_DIM}  - {item.get('path')}{COLOR_RESET}")
             if is_active:
                 print(f"{COLOR_YELLOW}注意: 客户端仍保持当前登录，但本地备份已移除。{COLOR_RESET}")
         else:

@@ -2134,6 +2134,154 @@ class TestWorkBuddyCore(unittest.TestCase):
         leftovers = [n for n in os.listdir(trash_dir) if n.endswith(".info")] if os.path.isdir(trash_dir) else []
         self.assertEqual(leftovers, [])
 
+    def test_t77_archive_rollback_failure_keeps_bundle(self):
+        """T77: 回滚也失败时，绝不能删 bundle——那可能是唯一副本"""
+        import io
+
+        self._write_profile("rb2", "uid-rb2", "RB2")
+        profile_dir, _cloud = self._write_account_memory("uid-rb2")
+        real_move = workbuddy._move_path
+        state = {"n": 0}
+
+        def flaky(src, dest):
+            state["n"] += 1
+            if state["n"] == 3:
+                raise OSError("模拟第二项被占用")
+            if state["n"] == 4:
+                raise OSError("模拟回滚目标被占用")
+            return real_move(src, dest)
+
+        with patch.object(workbuddy, "_move_path", side_effect=flaky):
+            with patch("sys.stdout", io.StringIO()):
+                res = workbuddy.remove_profile("rb2", yes=True, purge_memory=True)
+
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["action"], "error")
+        self.assertTrue(res["memory_bundle"], "回滚失败时必须保留归档路径")
+        self.assertTrue(os.path.isdir(res["memory_bundle"]))
+        self.assertTrue(os.path.isfile(os.path.join(res["memory_bundle"], "manifest.json")))
+        names = []
+        for _base, _dirs, files in os.walk(res["memory_bundle"]):
+            names.extend(files)
+        self.assertIn("MEMORY.md", names, "唯一一份 MEMORY.md 不能凭空消失")
+
+    def test_t78_credential_rollback_failure_is_reported_honestly(self):
+        """T78: 凭证也放不回时，输出必须说"仍在回收站"，不能谎称已放回"""
+        import io
+
+        path = self._write_profile("rb3", "uid-rb3", "RB3")
+        real_move = workbuddy._move_path
+        state = {"n": 0}
+
+        def flaky(src, dest):
+            state["n"] += 1
+            if state["n"] == 2:
+                raise OSError("模拟凭证回滚被占用")
+            return real_move(src, dest)
+
+        fake = {"action": "error", "message": "模拟档案失败", "bundle": None,
+                "items": [], "skipped_links": []}
+        with patch.object(workbuddy, "archive_account_memory", return_value=fake):
+            with patch.object(workbuddy, "_move_path", side_effect=flaky):
+                with patch("sys.stdout", io.StringIO()):
+                    res = workbuddy.remove_profile("rb3", yes=True, purge_memory=True)
+
+        self.assertFalse(res["ok"])
+        self.assertFalse(res["credential_restored"])
+        self.assertFalse(os.path.exists(path))
+        self.assertTrue(res["trash_path"] and os.path.exists(res["trash_path"]))
+        self.assertIn("仍在回收站", res["message"])
+
+    @unittest.skipUnless(sys.platform == "win32", "junction 仅 Windows")
+    def test_t79_junction_is_never_traversed(self):
+        """T79: junction 不能被当成普通目录遍历/删除，目标内容必须原样保留"""
+        root = os.path.dirname(workbuddy.PROFILES_DIR)
+        inside = os.path.join(root, "junction-target")
+        os.makedirs(inside)
+        marker = os.path.join(inside, "MEMORY.md")
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write("must-stay")
+        link = os.path.join(root, "user-uid-junc-personal")
+        rc = subprocess.run(["cmd", "/c", "mklink", "/J", link, inside],
+                            capture_output=True).returncode
+        if rc != 0:
+            self.skipTest("当前环境无法创建 junction")
+        self.assertTrue(workbuddy._is_reparse_point(link))
+        self.assertEqual(workbuddy.get_account_archive_paths("uid-junc"), [])
+
+        workbuddy._remove_tree(link)
+        self.assertFalse(os.path.exists(link))
+        self.assertTrue(os.path.exists(marker), "junction 目标内容被误删")
+
+        # 真实目录里嵌一个 junction，删目录时也不能跟进去
+        real = os.path.join(root, "real-with-junction")
+        os.makedirs(real)
+        link2 = os.path.join(real, "nested-link")
+        if subprocess.run(["cmd", "/c", "mklink", "/J", link2, inside],
+                          capture_output=True).returncode == 0:
+            workbuddy._remove_tree(real)
+            self.assertFalse(os.path.exists(real))
+            self.assertTrue(os.path.exists(marker), "嵌套 junction 目标内容被误删")
+
+    def test_t80_list_trash_shows_memory_bundles_and_restore_memory(self):
+        """T80: 只剩记忆归档时不能谎称"回收站为空"；--restore-memory 可单独还原"""
+        import io
+
+        self._write_profile("orphan", "uid-orphan", "Orphan")
+        profile_dir, cloud_path = self._write_account_memory("uid-orphan")
+        with patch("sys.stdout", io.StringIO()):
+            removed = workbuddy.remove_profile("orphan", yes=True, purge_memory=True)
+        stem = os.path.basename(removed["trash_path"])[:-5]
+        os.remove(removed["trash_path"])
+
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            workbuddy.list_trash_cmd()
+        out = buf.getvalue()
+        self.assertIn("记忆归档", out)
+        self.assertNotIn("回收站为空", out)
+        self.assertIn(stem, out)
+
+        with patch("sys.stdout", io.StringIO()):
+            rc = workbuddy.run_remove_cmd(["--restore-memory", stem])
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.isfile(os.path.join(profile_dir, "MEMORY.md")))
+        self.assertTrue(os.path.exists(cloud_path))
+
+        with patch("sys.stdout", io.StringIO()):
+            self.assertEqual(workbuddy.run_remove_cmd(["--restore-memory", "../" + stem]), 2)
+
+    def test_t81_reserve_trash_path_avoids_existing_memory_bundle(self):
+        """T81: 同名 stem 的旧记忆归档还在时，新凭证备份必须换序号，不能混写"""
+        trash = workbuddy.get_profiles_trash_dir()
+        os.makedirs(trash, exist_ok=True)
+        stem = "demo-20260101-000000"
+        os.makedirs(os.path.join(workbuddy.get_memory_trash_dir(), stem), exist_ok=True)
+
+        with patch.object(workbuddy.time, "strftime", return_value="20260101-000000"):
+            path = workbuddy._reserve_trash_path(trash, "demo")
+        try:
+            self.assertEqual(os.path.basename(path), stem + "-1.info")
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX 权限位")
+    def test_t82_memory_bundle_is_private(self):
+        """T82: 明文人格/记忆归档目录必须 0700，清单 0600"""
+        import stat
+
+        self._write_profile("perm", "uid-perm", "Perm")
+        self._write_account_memory("uid-perm")
+        with patch("sys.stdout", io.StringIO()):
+            res = workbuddy.remove_profile("perm", yes=True, purge_memory=True)
+        bundle = res["memory_bundle"]
+        self.assertEqual(stat.S_IMODE(os.stat(bundle).st_mode), 0o700)
+        manifest = os.path.join(bundle, "manifest.json")
+        self.assertEqual(stat.S_IMODE(os.stat(manifest).st_mode), 0o600)
+
 if __name__ == "__main__":
     unittest.main()
 

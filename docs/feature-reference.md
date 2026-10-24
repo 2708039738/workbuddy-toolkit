@@ -40,7 +40,7 @@
 
 删除本地已保存的账号凭证，用于清理不再使用的副号，避免账号列表越来越长。
 
-删除默认是可逆的：凭证被移入 `~/.workbuddy/auth_profiles_trash/`，需要彻底抹除时再加 `--purge`。凭证与客户端按 UID 写下的人格/记忆（`user-<uid>-*/`、`memory/<uid>_memory.md`）是两层数据：默认只删凭证并提示记忆位置，加 `--purge-memory` 才把档案一并归档，`--restore` 会把配对的两者一起还原，`--restore-memory` 可在凭证已删/改名时单独还原档案。当前活跃账号、同一 UID 的多份 Profile、符号链接/junction 与自动化环境都有额外保护，详见[命令参考](command-reference.md#删除账号)。
+删除默认是可逆的：凭证被移入 `~/.workbuddy/auth_profiles_trash/`，需要彻底抹除时再加 `--purge`。凭证与客户端按 UID 写下的人格/记忆（`user-<uid>-*/`、`memory/<uid>_memory.md`）是两层数据：默认只删凭证并提示记忆位置，加 `--purge-memory` 才把档案一并归档，`--restore` 会把配对的两者一起还原，`--restore-memory` 可在凭证已删/改名时单独还原档案，`--purge-trash` 可单条清理损坏/占位残留。删活跃账号会留独立墓碑，`wb-checkin` 不会自动重新收录。当前活跃账号、同一 UID 的多份 Profile、符号链接/junction 与自动化环境都有额外保护，详见[命令参考](command-reference.md#删除账号)。
 
 ### 凭据健康巡检 — `wb-audit`
 

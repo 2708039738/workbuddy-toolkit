@@ -89,6 +89,7 @@ workbuddy remove <账号名|昵称|UID> [--yes] [--force] [--purge] [--purge-mem
 workbuddy remove --list-trash [--json]
 workbuddy remove --restore <回收站文件名> [--yes] [--force] [--json]
 workbuddy remove --restore-memory <归档目录名> [--json]
+workbuddy remove --purge-trash <文件名|归档目录名> [--yes] [--json]
 ```
 
 （`wb-remove` 是安装后提供的别名，参数完全相同。）
@@ -104,7 +105,8 @@ workbuddy remove --restore-memory <归档目录名> [--json]
 | `--purge` | 凭证与已归档的账号档案永久删除，不进回收站 |
 | `--purge-memory` | 同时清理该 UID 的人格/记忆档案；默认移入回收站，与 `--purge` 连用才抹除 |
 | `--restore-memory <名称>` | 只还原一个记忆归档；凭证已手工删除或改名、无法用 `--restore` 配对时使用 |
-| `--json` | 输出机器可读结果（含 `memory_action` / `memory_bundle` / `memory_items` / `memory_kept` / `memory_links`） |
+| `--purge-trash <名称>` | 永久清除单条回收站残留（0 字节占位、损坏备份）；给凭证名时连同配对的记忆归档一起清 |
+| `--json` | 输出机器可读结果（含 `memory_action` / `memory_bundle` / `memory_items` / `memory_kept` / `memory_links` / `memory_new`） |
 | `--` | 之后的内容一律按位置参数处理，用于 `-weird` 这类以连字符开头的账号别名，例如 `workbuddy remove --yes -- -weird` |
 
 未知选项、或给出的目标账号多于一个时，只打印用法并以**退出码 2** 结束，不执行任何删除。
@@ -133,6 +135,8 @@ workbuddy remove old_acc --yes --purge --purge-memory   # 两者都彻底抹除
 
 - 目标必须唯一匹配（别名 / 昵称 / UID 前缀），有歧义时列出候选并拒绝执行；
 - 删除当前活跃账号需要显式 `--force`：客户端会保持当前登录，但本地不再有备份，切走后只能重新扫码；
+- 删除活跃账号后会写一条**独立于回收站的删除墓碑**：`wb-checkin` 不会从当前登录态自动把它重新收录；重新扫码登录或 `wb-save` 该账号会解除墓碑；
+- `--purge-memory` 在用户确认前先快照档案列表，确认期间新出现的档案不会被这次操作带走，输出会列明"确认后新增、已保留"；
 - 非交互式环境（管道、cron、定时任务）必须显式 `--yes`，否则直接拒绝（退出码 1），避免脚本误删；
 - 同一 UID 已无其他账号时，同步清理审计缓存，避免 `wb-status` / `wb-audit` 继续显示已删除账号；
 - 同一 UID 若还有别的 Profile，`--purge-memory` 默认拒绝（记忆按 UID 共享，清掉会让剩下那份登录后记忆全空），确认要清需再加 `--force`；
@@ -147,9 +151,12 @@ workbuddy remove old_acc --yes --purge --purge-memory   # 两者都彻底抹除
 workbuddy remove --list-trash                                  # 列出凭证备份与记忆归档
 workbuddy remove --restore demo-20260101-000000.info --yes     # 还原凭证 + 配对的人格/记忆
 workbuddy remove --restore-memory demo-20260101-000000         # 只还原记忆归档
+workbuddy remove --purge-trash demo-20260101-000000.info --yes # 单条清除损坏/占位残留
 ```
 
 `--restore` 把该备份还原为 `~/.workbuddy/auth_profiles/<别名>.info`；目标已存在则拒绝，需要 `--force` 覆盖。若存在同 stem 的记忆归档，会一并还原；**已存在的记忆路径一律不覆盖**，跳过项与归档位置会在输出里列明。`--restore-memory` 用于凭证备份已被手工删除或改名的情况：它只按 `manifest.json` 把人格/记忆放回原路径，同样不覆盖已存在路径。
+
+恢复前会校验备份能不能解析成凭证：0 字节占位或半截 JSON 默认拒绝（`refused_invalid`），避免"恢复成功但登录不了"的假象；确认要原样取回可加 `--force`，只想清理则用 `--purge-trash`。
 
 如果账号别名刚好是 `remove` / `rm` / `delete` / `del` / `forget`，这几个词现在优先按子命令解析。切换这类账号请显式用 `workbuddy switch <别名>`；裸敲命令（如 `workbuddy rm`）只会打印用法，不会删除任何账号。
 

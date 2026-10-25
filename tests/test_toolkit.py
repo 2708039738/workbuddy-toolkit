@@ -2282,6 +2282,7 @@ class TestWorkBuddyCore(unittest.TestCase):
     @unittest.skipIf(sys.platform == "win32", "POSIX 权限位")
     def test_t82_memory_bundle_is_private(self):
         """T82: 明文人格/记忆归档目录必须 0700，清单 0600"""
+        import io
         import stat
 
         self._write_profile("perm", "uid-perm", "Perm")

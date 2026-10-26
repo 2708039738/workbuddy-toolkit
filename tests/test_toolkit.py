@@ -1708,6 +1708,112 @@ class TestRemoveMemory(unittest.TestCase):
         self.assertTrue(os.path.exists(legacy), "旧代全局文件被当成本账号记忆搬走了")
         self.assertIn("旧代全局人格文件", buf.getvalue())
 
+    def test_t110_purge_keeps_bundle_when_credential_delete_fails(self):
+        """T110: 凭证删不掉时，配对归档必须留着（否则人格永久丢失）"""
+        self._profile("acc10", "uid10")
+        self._memory("uid10")
+        with patch("sys.stdout", io.StringIO()):
+            workbuddy.remove_profile("acc10", assume_yes=True, purge_memory=True)
+        _d, bundles = workbuddy._memory_bundle_items()
+        bundle = bundles[0]["path"]
+        cred = os.path.basename(workbuddy._trash_files()[0])
+        real_remove = os.remove
+
+        def stuck(src, *args, **kwargs):
+            if str(src).endswith(".info"):
+                raise OSError("模拟被占用")
+            return real_remove(src, *args, **kwargs)
+
+        with patch.object(workbuddy.os, "remove", side_effect=stuck):
+            with patch("sys.stdout", io.StringIO()):
+                ok = workbuddy.purge_trash(cred, force=True)
+        self.assertFalse(ok)
+        self.assertTrue(os.path.isdir(bundle), "凭证没删掉，归档却先被删了")
+
+    def test_t111_orphan_bundle_is_listed_and_purgeable(self):
+        """T111: 凭证已清空、只剩归档时，必须能看见也能销毁"""
+        stem = "acc11.20260101-000000-000000"
+        bundle = os.path.join(workbuddy.get_memory_trash_dir(), stem)
+        os.makedirs(os.path.join(bundle, "files"))
+        with open(os.path.join(bundle, "files", "0-MEMORY.md"), "w", encoding="utf-8") as f:
+            f.write("mem")
+        workbuddy.atomic_write_json(os.path.join(bundle, "manifest.json"), {
+            "version": 1, "uid": "uid11", "alias": "acc11",
+            "items": [{"kind": "profile_file", "type": "file",
+                       "src": os.path.join(self.root, "user-uid11-personal", "MEMORY.md"),
+                       "rel": "files/0-MEMORY.md"}],
+        })
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            workbuddy.list_trash()
+        self.assertIn("人格/记忆归档", buf.getvalue())
+        with patch("sys.stdout", io.StringIO()):
+            ok = workbuddy.purge_trash(stem, force=True)
+        self.assertTrue(ok, "孤儿归档删不掉")
+        self.assertFalse(os.path.isdir(bundle))
+
+    def test_t112_invalid_uid_is_reported_and_exits_3(self):
+        """T112: uid 非法时不能静默跳过，必须说明且退出码 3"""
+        path = os.path.join(workbuddy.PROFILES_DIR, "acc12.info")
+        workbuddy.atomic_write_json(path, {
+            "account": {"uid": "../evil", "nickname": "Evil"},
+            "auth": {"accessToken": "t", "expiresAt": 1800000000000,
+                     "refreshExpiresAt": 1900000000000},
+        })
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            with self.assertRaises(SystemExit) as ctx:
+                workbuddy.remove_main(["acc12", "-y", "--purge-memory"])
+        self.assertEqual(ctx.exception.code, 3)
+        self.assertIn("明文记忆仍在磁盘上", buf.getvalue())
+
+    def test_t113_shared_uid_does_not_move_other_alias_memory(self):
+        """T113: 同 uid 还有别的别名时，不能把人家的人格搬走"""
+        self._profile("one13", "uid13")
+        self._profile("two13", "uid13")
+        acct = self._memory("uid13")
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            with self.assertRaises(SystemExit) as ctx:
+                workbuddy.remove_main(["one13", "-y", "--purge-memory"])
+        self.assertEqual(ctx.exception.code, 3)
+        self.assertTrue(os.path.exists(os.path.join(acct, "MEMORY.md")),
+                        "把同 uid 另一个别名的记忆搬走了")
+        self.assertIn("还有别的别名", buf.getvalue())
+
+    def test_t114_manifest_shrinks_after_restore(self):
+        """T114: 还原成功后清单要跟着缩，第二次还原不能报'归档文件缺失'"""
+        self._profile("acc14", "uid14")
+        self._memory("uid14")
+        with patch("sys.stdout", io.StringIO()):
+            workbuddy.remove_profile("acc14", assume_yes=True, purge_memory=True)
+        _d, bundles = workbuddy._memory_bundle_items()
+        stem = bundles[0]["name"]
+        with patch("sys.stdout", io.StringIO()):
+            workbuddy.restore_memory_cmd(stem)
+        if os.path.isdir(bundles[0]["path"]):
+            manifest = workbuddy._read_archive_manifest(bundles[0]["path"]) or {}
+            self.assertEqual(manifest.get("items"), [], "清单没跟着磁盘更新")
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            workbuddy.restore_memory_cmd(stem)
+        self.assertNotIn("归档文件缺失", buf.getvalue())
+
+    def test_t115_empty_trash_removes_orphan_bundle(self):
+        """T115: 清空回收站要连孤儿归档一起清，否则明文残留永远删不掉"""
+        stem = "acc15.20260101-000000-000000"
+        bundle = os.path.join(workbuddy.get_memory_trash_dir(), stem)
+        os.makedirs(os.path.join(bundle, "files"))
+        with open(os.path.join(bundle, "files", "0-MEMORY.md"), "w", encoding="utf-8") as f:
+            f.write("mem")
+        workbuddy.atomic_write_json(os.path.join(bundle, "manifest.json"), {
+            "version": 1, "uid": "uid15", "alias": "acc15", "items": [],
+        })
+        with patch("sys.stdout", io.StringIO()):
+            ok = workbuddy.empty_trash(force=True)
+        self.assertTrue(ok)
+        self.assertFalse(os.path.isdir(bundle))
+
     def test_t109_partial_memory_makes_cli_exit_3(self):
         """T109: 账号删了但档案没搬干净，CLI 必须给 3 而不是 0"""
         self._profile("acc9", "uid9")

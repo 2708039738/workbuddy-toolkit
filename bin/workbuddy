@@ -3571,7 +3571,7 @@ def archive_account_memory(uid, alias, stem, purge=False, items=None, links=None
     return result
 
 def restore_account_memory(stem):
-    """把 <stem> 对应的记忆归档还原回原路径。
+    """把 <stem> 对应的记忆归档还原回原路径（归档在 auth_profiles/.trash/memory/）。
 
     已存在的目标一律不覆盖：宁可留下归档让用户自己处理，也不能用旧记忆
     盖掉账号重新登录后产生的新记忆。
@@ -3630,6 +3630,14 @@ def restore_account_memory(stem):
             remaining.append(item)
             continue
         result["restored"].append(src)
+
+    try:
+        # 清单跟着磁盘更新：已还原的项不再留在清单里，否则第二次还原会把
+        # "已搬回原处"误报成"归档文件缺失"
+        manifest["items"] = remaining
+        atomic_write_json(os.path.join(bundle, _ARCHIVE_MANIFEST), manifest)
+    except OSError:
+        pass
 
     if remaining:
         result["action"] = "partial" if result["restored"] else "skipped"
@@ -3751,7 +3759,7 @@ def release_state_lock(token):
 _LAST_REMOVE_EXIT = 0
 _LAST_RESTORE_EXIT = 0
 
-def _print_memory_archive_result(mem):
+def _print_memory_archive_result(mem, uid=None):
     """把记忆归档结果说清楚：成功给位置，失败给原因和下一步。"""
     action = mem.get("action")
     if action == "trashed":
@@ -3774,6 +3782,15 @@ def _print_memory_archive_result(mem):
         print(f"{COLOR_YELLOW}▲ 人格/记忆未能归档: {mem.get('message')}{COLOR_RESET}")
     elif action == "unknown_layout":
         print(f"{COLOR_YELLOW}ℹ 没找到该账号的人格/记忆目录（可能从未使用过，或目录名不在白名单）{COLOR_RESET}")
+    elif action == "skipped_shared_uid":
+        print(f"{COLOR_YELLOW}▲ 该 UID 还有别的别名在用，人格/记忆未搬动（否则会把另一个别名的人格一起带走）。{COLOR_RESET}")
+        print(f"{COLOR_YELLOW}  确认要清理，请先删除同 UID 的其他别名，或手工处理对应目录。{COLOR_RESET}")
+    elif action == "skipped_invalid_uid":
+        print(f"{COLOR_RED}▲ 人格/记忆未清理: {mem.get('message') or 'UID 非法'}{COLOR_RESET}")
+        print(f"{COLOR_RED}  凭证已按你的要求删除，但明文记忆仍在磁盘上，请手工处理。{COLOR_RESET}")
+    if uid:
+        for item in get_account_lookalike_paths(uid)[:3]:
+            print(f"{COLOR_YELLOW}  疑似但不是该账号的目录（未动）: {item}{COLOR_RESET}")
 
 def _print_memory_restore_result(mem):
     action = mem.get("action")
@@ -3969,13 +3986,15 @@ def _memory_bundle_items():
     return d, items
 
 def list_trash():
-    """列出回收站里的账号凭据。"""
+    """列出回收站里的账号凭据与人格/记忆归档。"""
     items = _trash_files()
-    if not items:
+    _mem_dir, bundles = _memory_bundle_items()
+    if not items and not bundles:
         print("回收站为空。")
         return
-    print(f"\n回收站 ({len(items)} 项) — 恢复: workbuddy remove --restore <文件名>"
-          f"；单条销毁: workbuddy remove --purge <文件名>")
+    if items:
+        print(f"\n回收站 ({len(items)} 项) — 恢复: workbuddy remove --restore <文件名>"
+              f"；单条销毁: workbuddy remove --purge <文件名>")
     for n in items:
         fpath = os.path.join(get_trash_dir(), n)
         try:
@@ -3991,10 +4010,9 @@ def list_trash():
         except Exception:
             print(f"  {n}  (无法解析){residue}")
 
-    _mem_dir, bundles = _memory_bundle_items()
     if bundles:
         print(f"\n人格/记忆归档 ({len(bundles)} 份) — 还原: workbuddy remove --restore-memory <名称>"
-              f"；销毁: workbuddy remove --purge <凭证名>")
+              f"；销毁: workbuddy remove --purge <名称>")
         for b in bundles:
             flag = f"{COLOR_YELLOW}  (部分){COLOR_RESET}" if b["partial"] else ""
             print(f"  {b['name']}  ({b['items']} 项){flag}")
@@ -4114,9 +4132,20 @@ def _restore_profile_locked(trash_name):
     else:
         print(f"{COLOR_GREEN}✔ 已恢复为账号别名 '{dst_alias}'（原别名 '{original_alias}' 已被占用，自动加序号）。{COLOR_RESET}")
 
-    # 同 stem 的档案一起回来，避免"账号回来了但人格是空的"
+    # 同 stem 的档案一起回来，避免"账号回来了但人格是空的"。
+    # 先核对归档 uid 与凭证 uid：同 stem 但不同账号时不能还原，
+    # 否则会把 A 的人格装进 B 的账号。
     global _LAST_RESTORE_EXIT
     _LAST_RESTORE_EXIT = 0
+    bundle_for_mem = os.path.join(get_memory_trash_dir(), fname[:-5])
+    if os.path.isdir(bundle_for_mem):
+        manifest = _read_archive_manifest(bundle_for_mem) or {}
+        mem_uid = str(manifest.get("uid") or "").strip()
+        if mem_uid and mem_uid != uid:
+            print(f"{COLOR_RED}▲ 归档属于另一个账号（归档 uid {mem_uid[:8]}… / 凭证 uid {uid[:8]}…），未还原。{COLOR_RESET}")
+            print(f"  归档保留在: {bundle_for_mem}")
+            _LAST_RESTORE_EXIT = 3
+            return True
     mem = restore_account_memory(fname[:-5])
     _print_memory_restore_result(mem)
     if mem.get("action") == "error":
@@ -4124,10 +4153,13 @@ def _restore_profile_locked(trash_name):
     return True
 
 def empty_trash(force=False, force_partial=False):
-    """清空回收站——此操作不可恢复，凭据将被彻底销毁。
+    """清空回收站——此操作不可恢复，凭据与人格/记忆档案都会被销毁。
 
     注意：清空回收站会同时解除删除墓碑——若被删账号仍处于客户端登录态，
     下次签到的自动发现会把它重新收录。
+
+    顺序：每份凭证先删，成功后才删配对归档。凭证删不掉时归档必须留着，
+    否则会出现"账号还能 --restore、人格已经没了"。
     """
     shown = sorted(_trash_files())
     _mem_dir, bundles = _memory_bundle_items()
@@ -4144,33 +4176,57 @@ def empty_trash(force=False, force_partial=False):
         print(f"{COLOR_YELLOW}▲ 提示: 清空后墓碑随之解除——仍处于登录态的已删账号，下次签到会被重新收录。{COLOR_RESET}")
     if not force:
         try:
-            ans = input(f"{COLOR_YELLOW}确认彻底销毁这些凭据? [y/N]: {COLOR_RESET}").strip().lower()
+            ans = input(f"{COLOR_YELLOW}确认彻底销毁这些内容? [y/N]: {COLOR_RESET}").strip().lower()
         except (KeyboardInterrupt, EOFError):
             print("\n已取消。")
             return False
         if ans not in ("y", "yes"):
             print("已取消。")
             return False
+
+    kept_partial = []
+    failed = []
+    deleted_creds = 0
+    deleted_bundles = 0
     try:
         with _TrashLock():
-            # 只销毁「已展示并确认」的那一批（交叉审查必修 1：锁内重新全量
-            # 删除会把确认期间新增的条目一并销毁——用户从未见过它们）。
-            kept_partial = []
+            # 只销毁「已展示并确认」的那一批（锁内重新全量删除会把确认期间
+            # 新增的条目一并销毁——用户从未见过它们）。
             current = sorted(_trash_files())
             to_delete = [n for n in shown if n in current]
             new_arrivals = [n for n in current if n not in shown]
-            failed = []
             for n in to_delete:
                 try:
-                    bundle = os.path.join(get_memory_trash_dir(), n[:-5])
-                    if os.path.isdir(bundle):
-                        if _bundle_is_partial(bundle) and not force_partial:
-                            kept_partial.append(n[:-5])
-                        else:
-                            _remove_tree(bundle)
                     os.remove(os.path.join(get_trash_dir(), n))
+                    deleted_creds += 1
                 except OSError as e:
+                    # 凭证没删掉：配对归档必须原样保留，否则只剩"还能恢复的账号 + 已消失的人格"
                     failed.append(f"{n}: {e}")
+                    continue
+                bundle = os.path.join(get_memory_trash_dir(), n[:-5])
+                if os.path.isdir(bundle):
+                    if _bundle_is_partial(bundle) and not force_partial:
+                        kept_partial.append(n[:-5])
+                        continue
+                    try:
+                        _remove_tree(bundle)
+                        deleted_bundles += 1
+                    except OSError as e:
+                        failed.append(f"{n[:-5]} 的归档: {e}")
+            # 孤儿归档：凭证已经被别的操作清掉，只剩档案。没有这一步它们
+            # 会变成 CLI 看不见、也删不掉的明文残留。
+            known_stems = {n[:-5] for n in current}
+            for b in bundles:
+                if b["name"] in known_stems or b["name"] in kept_partial:
+                    continue
+                if b["partial"] and not force_partial:
+                    kept_partial.append(b["name"])
+                    continue
+                try:
+                    _remove_tree(b["path"])
+                    deleted_bundles += 1
+                except OSError as e:
+                    failed.append(f"{b['name']} 的归档: {e}")
             if new_arrivals:
                 print(f"{COLOR_YELLOW}▲ 另有 {len(new_arrivals)} 项在你确认期间新增，未删除:"
                       f"重跑 remove --empty-trash 可再次确认。{COLOR_RESET}")
@@ -4180,63 +4236,79 @@ def empty_trash(force=False, force_partial=False):
         # 含 TimeoutError；回收站/锁文件异常时优雅失败
         print(f"{COLOR_RED}清空失败: {e}{COLOR_RESET}")
         return False
+
     if kept_partial:
         print(f"{COLOR_YELLOW}▲ {len(kept_partial)} 份人格档案标着 partial（源目录没删净），已保留：{COLOR_RESET}")
         for name in kept_partial[:5]:
             print(f"  - {name}")
-        print(f"  确认不再需要请单独执行 workbuddy remove --purge <凭证名> --force-partial")
+        print(f"  确认不再需要请执行 workbuddy remove --purge <归档名> --force-partial")
     if failed:
         print(f"{COLOR_RED}清空失败 {len(failed)} 项（其余已删除）:{COLOR_RESET}")
         for line in failed:
             print(f"  - {line}")
         return False
-    if not to_delete:
+    if not deleted_creds and not deleted_bundles:
         print("已确认的条目已被其他进程清空，未删除任何内容。")
         return True
-    print(f"{COLOR_GREEN}✔ 回收站已清空 ({len(to_delete)} 项)。{COLOR_RESET}")
+    summary = f"{deleted_creds} 份凭证"
+    if deleted_bundles:
+        summary += f" / {deleted_bundles} 份人格档案"
+    if kept_partial:
+        print(f"{COLOR_GREEN}✔ 已销毁 {summary}；{len(kept_partial)} 份 partial 档案按约定保留。{COLOR_RESET}")
+    else:
+        print(f"{COLOR_GREEN}✔ 回收站已清空（{summary}）。{COLOR_RESET}")
     return True
 
 def purge_trash(trash_name, force=False, force_partial=False):
     """单条销毁回收站条目——不可恢复。
 
-    与 --empty-trash 的区别：只销毁指定的一条。场景：回收站里混进一条
-    0 字节/坏 JSON 的占位（工具残留或搬运被打断），它既不能 --restore
-    （fail closed 拒绝），也不值得为它清空整个回收站（交叉审查必修 5）。
+    与 --empty-trash 的区别：只销毁指定的一条。也接受"孤儿归档"的名字
+    （凭证已被清空、只剩人格/记忆档案），否则那份明文档案没有任何清理入口。
+
+    销毁顺序：先凭证、后归档。反过来时，凭证删除失败会留下"账号还能恢复、
+    人格已经永久没了"的半截状态。
     """
     fname = _validate_trash_name(trash_name)
     if not fname:
         return False
+    stem = fname[:-5]
     try:
         with _TrashLock():
             src = os.path.join(get_trash_dir(), fname)
-            if not os.path.isfile(src):
+            bundle = os.path.join(get_memory_trash_dir(), stem)
+            has_cred = os.path.isfile(src)
+            has_bundle = os.path.isdir(bundle)
+            if not has_cred and not has_bundle:
                 print(f"{COLOR_RED}错误: 回收站里没有 '{fname}'。{COLOR_RESET}")
                 list_trash()
                 return False
-            bundle = os.path.join(get_memory_trash_dir(), fname[:-5])
-            has_bundle = os.path.isdir(bundle)
             if has_bundle and _bundle_is_partial(bundle) and not force_partial:
-                # 源目录没删净时，这份归档可能是唯一完整副本，不能跟着凭证一起销毁
-                print(f"{COLOR_RED}▲ 拒绝销毁: '{fname}' 配对的人格/记忆归档不完整（标着 partial）。{COLOR_RESET}")
+                # 源目录没删净时，这份归档可能是唯一完整副本，不能销毁
+                print(f"{COLOR_RED}▲ 拒绝销毁: '{stem}' 的人格/记忆归档不完整（标着 partial）。{COLOR_RESET}")
                 print(f"  归档: {bundle}")
                 print(f"  确认不再需要请加 {COLOR_BOLD}--force-partial{COLOR_RESET}。")
                 return False
-            # 锁内读内容只为墓碑提示；坏条目照常可销毁（这正是本命令的用途）
+
             uid = None
             size = -1
-            try:
-                size = os.path.getsize(src)
-            except OSError:
-                pass
-            try:
-                with open(src, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    uid = str((data.get("account") or {}).get("uid") or "").strip() or None
-            except Exception:
-                pass
-            print(f"即将彻底销毁: {fname}"
-                  + ("  (0 字节占位，疑似工具残留)" if size == 0 else ""))
+            if has_cred:
+                try:
+                    size = os.path.getsize(src)
+                except OSError:
+                    pass
+                try:
+                    with open(src, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if isinstance(data, dict):
+                        uid = str((data.get("account") or {}).get("uid") or "").strip() or None
+                except Exception:
+                    pass
+                print(f"即将彻底销毁: {fname}"
+                      + ("  (0 字节占位，疑似工具残留)" if size == 0 else "")
+                      + ("（含配对的人格/记忆归档）" if has_bundle else ""))
+            else:
+                print(f"即将彻底销毁孤儿人格/记忆归档: {stem}")
+
             if not force:
                 try:
                     ans = input(f"{COLOR_YELLOW}确认销毁这一条? [y/N]: {COLOR_RESET}").strip().lower()
@@ -4246,14 +4318,30 @@ def purge_trash(trash_name, force=False, force_partial=False):
                 if ans not in ("y", "yes"):
                     print("已取消。")
                     return False
-            try:
-                if has_bundle:
+
+            if has_cred:
+                try:
+                    os.remove(src)
+                except OSError as e:
+                    print(f"{COLOR_RED}销毁失败: {e}{COLOR_RESET}")
+                    return False
+            bundle_failed = None
+            if has_bundle:
+                try:
                     _remove_tree(bundle)
-                os.remove(src)
-            except OSError as e:
-                print(f"{COLOR_RED}销毁失败: {e}{COLOR_RESET}")
-                return False
-        print(f"{COLOR_GREEN}✔ 已彻底销毁 '{fname}'" + ("（含人格/记忆归档）" if has_bundle else "") + f"。{COLOR_RESET}")
+                except OSError as e:
+                    bundle_failed = str(e)
+
+        if has_cred:
+            print(f"{COLOR_GREEN}✔ 已彻底销毁 '{fname}'"
+                  + ("（含人格/记忆归档）" if has_bundle and not bundle_failed else "")
+                  + f"。{COLOR_RESET}")
+        else:
+            print(f"{COLOR_GREEN}✔ 已彻底销毁孤儿归档 '{stem}'。{COLOR_RESET}")
+        if bundle_failed:
+            print(f"{COLOR_RED}▲ 凭证已销毁，但归档未能删除: {bundle_failed}{COLOR_RESET}")
+            print(f"  归档: {bundle}（可加 --force-partial 重试）")
+            return False
         if uid:
             print(f"{COLOR_YELLOW}▲ 提示: 该账号的删除墓碑随之解除——若它仍处于登录态，下次签到会被重新收录。{COLOR_RESET}")
         return True
@@ -4524,12 +4612,19 @@ def remove_profile(target_name, assume_yes=False, force=False, purge_memory=Fals
             # 人格/记忆与凭据用同一个 stem 配对：--restore 据此一起还原
             if purge_memory:
                 stem = os.path.basename(trash_path)[:-5]
-                # 底座的删除只有"移入回收站"一种落点：档案跟着进回收站，
-                # 真正的抹除交给 --purge / --empty-trash 统一处理
-                mem = archive_account_memory(target["uid"], target_name, stem,
-                                             purge=False)
-                _print_memory_archive_result(mem)
-                if mem.get("action") in ("partial", "error"):
+                others = [n for n, p in profiles.items()
+                          if n != target_name and p.get("uid") == target["uid"]]
+                if others:
+                    # 记忆目录按 uid 组织：搬走会把另一个别名的记忆一起带走
+                    mem = {"action": "skipped_shared_uid"}
+                else:
+                    # 底座的删除只有"移入回收站"一种落点：档案跟着进回收站，
+                    # 真正的抹除交给 --purge / --empty-trash 统一处理
+                    mem = archive_account_memory(target["uid"], target_name, stem,
+                                                 purge=False)
+                _print_memory_archive_result(mem, uid=target["uid"])
+                if mem.get("action") in ("partial", "error", "skipped_invalid_uid",
+                                         "skipped_shared_uid"):
                     # 账号删了但档案没搬干净：退出码 3，脚本能看出来
                     _LAST_REMOVE_EXIT = 3
             return True

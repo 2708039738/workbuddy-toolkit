@@ -3383,7 +3383,10 @@ def archive_account_memory(uid, alias, stem, purge=False, items=None, links=None
         return result
     if not is_valid_account_uid(uid):
         result["action"] = "skipped_invalid_uid"
-        result["message"] = "UID 含路径成分，拒绝据此清理账号档案"
+        if len(str(uid)) > 64:
+            result["message"] = f"UID 超长（{len(str(uid))} 字符，上限 64），拒绝据此清理账号档案"
+        else:
+            result["message"] = "UID 含路径成分或非法字符，拒绝据此清理账号档案"
         return result
 
     if items is None:
@@ -4195,6 +4198,9 @@ def empty_trash(force=False, force_partial=False):
             current = sorted(_trash_files())
             to_delete = [n for n in shown if n in current]
             new_arrivals = [n for n in current if n not in shown]
+            _d2, current_bundles = _memory_bundle_items()
+            shown_bundle_names = {b["name"] for b in bundles}
+            new_bundles = [b for b in current_bundles if b["name"] not in shown_bundle_names]
             for n in to_delete:
                 try:
                     os.remove(os.path.join(get_trash_dir(), n))
@@ -4232,6 +4238,11 @@ def empty_trash(force=False, force_partial=False):
                       f"重跑 remove --empty-trash 可再次确认。{COLOR_RESET}")
                 for n in new_arrivals:
                     print(f"  + {n}")
+            if new_bundles:
+                print(f"{COLOR_YELLOW}▲ 另有 {len(new_bundles)} 份人格档案在你确认期间新增，未删除:"
+                      f"重跑 remove --empty-trash 可再次确认。{COLOR_RESET}")
+                for b in new_bundles[:5]:
+                    print(f"  + {b['name']}")
     except OSError as e:
         # 含 TimeoutError；回收站/锁文件异常时优雅失败
         print(f"{COLOR_RED}清空失败: {e}{COLOR_RESET}")
@@ -4248,7 +4259,10 @@ def empty_trash(force=False, force_partial=False):
             print(f"  - {line}")
         return False
     if not deleted_creds and not deleted_bundles:
-        print("已确认的条目已被其他进程清空，未删除任何内容。")
+        if kept_partial:
+            print("没有可销毁的内容：partial 归档已按约定保留。")
+        else:
+            print("已确认的条目已被其他进程清空，未删除任何内容。")
         return True
     summary = f"{deleted_creds} 份凭证"
     if deleted_bundles:
@@ -4340,7 +4354,11 @@ def purge_trash(trash_name, force=False, force_partial=False):
             print(f"{COLOR_GREEN}✔ 已彻底销毁孤儿归档 '{stem}'。{COLOR_RESET}")
         if bundle_failed:
             print(f"{COLOR_RED}▲ 凭证已销毁，但归档未能删除: {bundle_failed}{COLOR_RESET}")
-            print(f"  归档: {bundle}（可加 --force-partial 重试）")
+            retry = f"workbuddy remove --purge {stem}"
+            if _bundle_is_partial(bundle):
+                retry += " --force-partial"
+            print(f"  归档: {bundle}")
+            print(f"  重试: {retry}")
             return False
         if uid:
             print(f"{COLOR_YELLOW}▲ 提示: 该账号的删除墓碑随之解除——若它仍处于登录态，下次签到会被重新收录。{COLOR_RESET}")

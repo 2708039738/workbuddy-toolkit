@@ -1799,6 +1799,26 @@ class TestRemoveMemory(unittest.TestCase):
             workbuddy.restore_memory_cmd(stem)
         self.assertNotIn("归档文件缺失", buf.getvalue())
 
+    def test_t116_empty_trash_partial_only_message(self):
+        """T116: 只剩 partial 归档时，不能说成'被其他进程清空'"""
+        stem = "acc16.20260101-000000-000000"
+        bundle = os.path.join(workbuddy.get_memory_trash_dir(), stem)
+        os.makedirs(os.path.join(bundle, "files"))
+        with open(os.path.join(bundle, "files", "0-MEMORY.md"), "w", encoding="utf-8") as f:
+            f.write("mem")
+        workbuddy.atomic_write_json(os.path.join(bundle, "manifest.json"), {
+            "version": 1, "uid": "uid16", "alias": "acc16", "partial": True, "items": [],
+        })
+        with open(os.path.join(bundle, "PARTIAL"), "w", encoding="utf-8"):
+            pass
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            ok = workbuddy.empty_trash(force=True)
+        self.assertTrue(ok)
+        self.assertTrue(os.path.isdir(bundle))
+        self.assertNotIn("其他进程清空", buf.getvalue())
+        self.assertIn("partial 归档已按约定保留", buf.getvalue())
+
     def test_t115_empty_trash_removes_orphan_bundle(self):
         """T115: 清空回收站要连孤儿归档一起清，否则明文残留永远删不掉"""
         stem = "acc15.20260101-000000-000000"
